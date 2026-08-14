@@ -1,0 +1,159 @@
+project:
+  name: smart_attendance_ai
+  version: "0.1.0"
+
+models:
+  detector:
+    path: models/scrfd_2.5g.onnx
+    sha256: 041F73F47371333D1D17A6FEE6C8AB4E6AECABEFE398FF32CCA4E2D5EAEE0AF9
+
+  recognizer:
+    path: models/resnet50_arcface.onnx
+    sha256: 4C06341C33C2CA1F86781DAB0E829F88AD5B64BE9FBA56E56BC9EBDEFC619E43
+
+detector:
+  input_width: 640
+  input_height: 640
+  score_threshold: 0.50
+  enrollment_min_score: 0.60
+  nms_threshold: 0.40
+  min_face_size: 40
+
+recognizer:
+  model_name: resnet50_arcface
+  input_width: 112
+  input_height: 112
+  embedding_size: 512
+  batch_size: 8
+  l2_normalize: true
+
+data:
+  students_csv: data/raw/students.csv
+  student_images: data/raw/student_images
+  accepted_previews: data/previews/accepted
+  rejected_previews: data/previews/rejected
+  aligned_previews: data/previews/aligned
+  gallery_npz: data/generated/face_gallery.npz
+  face_embeddings_csv: data/generated/face_embeddings.csv
+  student_templates_csv: data/generated/student_templates.csv
+  gallery_report: outputs/reports/gallery_report.json
+  calibrated_gallery_npz: data/generated/face_gallery_calibrated.npz
+  calibrated_gallery_manifest: data/generated/calibrated_gallery_manifest.csv
+  calibrated_gallery_report: outputs/reports/calibrated_gallery_report.json
+
+
+matcher:
+  strategy: top_k_mean
+  top_k: 1
+  min_score: 0.50
+  min_margin: 0.08
+  max_candidates: 3
+
+video:
+  development_path: data/raw/videos/development.mp4
+  test_path: data/raw/videos/test.mp4
+  probe_interval_seconds: 1.0
+  probe_max_samples: 120
+  probe_preview_count: 20
+
+video_recognition:
+  sample_interval_seconds: 1.0
+  max_samples: 68
+  preview_count: 20
+  min_detection_score: 0.60
+  min_face_size_original: 40
+  min_blur_score: 20
+  min_brightness: 35
+  max_brightness: 220
+
+
+calibration:
+  start_seconds: 0.0
+  end_seconds: 20.0
+  sample_interval_seconds: 4.0
+  min_detection_score: 0.60
+  min_face_size_original: 55
+  min_blur_score: 15
+  context_scale: 2.2
+  absent_student_ids:
+    - STU_001
+
+auto_calibration:
+  present_student_ids:
+    - STU_002
+    - STU_003
+    - STU_004
+    - STU_005
+    - STU_006
+    - STU_007
+    - STU_008
+    - STU_009
+    - STU_010
+    - STU_011
+    - STU_012
+    - STU_013
+    - STU_014
+    - STU_015
+  select_per_student: 3
+  minimum_assignment_score: 0.30
+
+
+validation:
+  start_seconds: 24.0
+  end_seconds: 62.0
+  sample_interval_seconds: 1.0
+  preview_interval_seconds: 4.0
+  minimum_attendance_observations: 3
+  expected_present:
+    - STU_002
+    - STU_003
+    - STU_004
+    - STU_005
+    - STU_006
+    - STU_007
+    - STU_008
+    - STU_009
+    - STU_010
+    - STU_011
+    - STU_012
+    - STU_013
+    - STU_014
+    - STU_015
+  expected_absent:
+    - STU_001
+
+
+runtime:
+  active_gallery: data/generated/face_gallery_calibrated.npz
+  provider: cuda
+  #provider: cpu
+  allow_cpu_fallback: true
+  device_id: 0
+
+
+tracking:
+  detection_interval_frames: 5
+  minimum_iou: 0.15
+  maximum_center_distance: 1.20
+  maximum_age_frames: 30
+  bbox_smoothing: 0.25
+  minimum_hits: 2
+
+attendance:
+  recognition_interval_frames: 30
+  minimum_track_hits: 2
+  identity_history_size: 8
+  minimum_identity_observations: 3
+  minimum_support_ratio: 0.60
+  minimum_average_score: 0.50
+  minimum_average_margin: 0.08
+
+# attendance:
+#  # session_id: development_session وكودك الحالي يأخذ session_id من الـRequest ويضعه في SessionConfig، وليس من YAML
+#   recognition_interval_frames: 10
+#   minimum_track_hits: 2
+#   identity_history_size: 8
+#   minimum_identity_observations: 3
+#   minimum_support_ratio: 0.60
+#   minimum_average_score: 0.55
+#   minimum_average_margin: 0.08
