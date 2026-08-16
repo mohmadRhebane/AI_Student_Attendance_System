@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import (
@@ -11,6 +11,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    Date,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -27,9 +28,10 @@ class ScanJob(Base):
     __table_args__ = (
         UniqueConstraint(
             "session_id",
+            "attendance_date",
             "scan_number",
-            name="uq_scan_job_session_scan",
-        ),
+            name="uq_scan_job_session_date_scan",
+),
         Index(
             "ix_scan_jobs_status_priority_eligible",
             "status",
@@ -41,6 +43,7 @@ class ScanJob(Base):
         },
     )
 
+
     id: Mapped[int] = mapped_column(
         BigInteger,
         primary_key=True,
@@ -51,6 +54,11 @@ class ScanJob(Base):
         ForeignKey("attendance.sessions.id"),
         nullable=False,
     )
+
+    attendance_date: Mapped[date] = mapped_column(
+    Date,
+    nullable=False,
+)
 
     scan_number: Mapped[int] = mapped_column(
         Integer,

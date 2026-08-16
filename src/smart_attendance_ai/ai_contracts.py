@@ -84,7 +84,7 @@ class AISettings:
     enrollment_staging_root: Path = Path(
         "data/enrollment_staging"
     )
-    minimum_enrollment_images: int = 2
+    minimum_enrollment_images: int = 1
 
     def normalized(self) -> "AISettings":
         root = Path(self.project_root).resolve()

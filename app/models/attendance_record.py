@@ -1,7 +1,7 @@
-from datetime import datetime
+from datetime import datetime,date
 from typing import TYPE_CHECKING
 
-from sqlalchemy import BigInteger, ForeignKey, Float, Boolean, Text, Enum, DateTime, func,UniqueConstraint
+from sqlalchemy import BigInteger, ForeignKey, Float, Boolean, Text, Enum, DateTime, func,UniqueConstraint,Date
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
 from app.enums import AttendanceStatus
@@ -26,6 +26,22 @@ class AttendanceRecord(Base):
         )
 #محمد3
     
+
+    __table_args__ = (
+    UniqueConstraint(
+        "session_id",
+        "attendance_date",
+        "student_id",
+        name=(
+            "uq_attendance_record_"
+            "session_date_student"
+        ),
+    ),
+    {"schema": "attendance"},
+)
+
+
+
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     student_id: Mapped[int] = mapped_column(ForeignKey("attendance.students.id"))
     session_id: Mapped[int] = mapped_column(ForeignKey("attendance.sessions.id"))
@@ -52,6 +68,12 @@ class AttendanceRecord(Base):
 
     manually_modified: Mapped[bool] = mapped_column(Boolean, default=False)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    attendance_date: Mapped[date] = mapped_column(
+    Date,
+    nullable=False,
+)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(),
                                                  onupdate=func.now())

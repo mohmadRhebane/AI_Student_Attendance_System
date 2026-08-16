@@ -1,4 +1,5 @@
-from datetime import datetime
+
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import (
@@ -9,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     UniqueConstraint,
     func,
+    Date,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -22,15 +24,30 @@ if TYPE_CHECKING:
 class AttendanceLogs(Base):
     __tablename__ = "attendance_logs"
 
+    # __table_args__ = (
+    #     UniqueConstraint(
+    #         "session_id",
+    #         "student_id",
+    #         "scan_number",
+    #         name="uq_attendance_log_session_student_scan",
+    #     ),
+    #     {"schema": "attendance"},
+    # )
+
     __table_args__ = (
         UniqueConstraint(
             "session_id",
+            "attendance_date",
             "student_id",
             "scan_number",
-            name="uq_attendance_log_session_student_scan",
+            name=(
+                "uq_attendance_log_"
+                "session_date_student_scan"
+            ),
         ),
         {"schema": "attendance"},
     )
+
 
     id: Mapped[int] = mapped_column(
         BigInteger,
@@ -63,6 +80,11 @@ class AttendanceLogs(Base):
         default=1,
         nullable=False,
     )
+
+    attendance_date: Mapped[date] = mapped_column(
+        Date,
+        nullable=False,
+)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

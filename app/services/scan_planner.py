@@ -189,7 +189,9 @@ async def plan_scan_jobs(
             select(SchedulerLog)
             .where(
                 SchedulerLog.session_id
-                == session_obj.id
+                == session_obj.id,
+                SchedulerLog.attendance_date
+                == current_date,
             )
         )
 
@@ -200,8 +202,14 @@ async def plan_scan_jobs(
         if scheduler_log is None:
             scheduler_log = SchedulerLog(
                 session_id=session_obj.id,
+
+                attendance_date=
+                    current_date,
+
                 scan_count=0,
-                scan_session_count=default_scan_count,
+
+                scan_session_count=
+                    default_scan_count,
             )
 
             db.add(scheduler_log)
@@ -230,8 +238,13 @@ async def plan_scan_jobs(
         # -----------------------------------------------------
         try:
             video_result = await db.execute(
-                select(Video).where(
-                    Video.session_id == session_obj.id
+                
+            select(Video).where(
+                    Video.session_id
+                    == session_obj.id,
+
+                    Video.attendance_date
+                    == current_date,
                 )
             )
 
@@ -286,7 +299,10 @@ async def plan_scan_jobs(
             select(ScanJob)
             .where(
                 ScanJob.session_id
-                == session_obj.id
+                == session_obj.id,
+                ScanJob.attendance_date
+    == current_date,
+
             )
             .order_by(
                 ScanJob.scan_number
@@ -319,15 +335,27 @@ async def plan_scan_jobs(
                 if window.scan_number == max_scans
                 else NORMAL_SCAN_PRIORITY
             )
-
             job = ScanJob(
                 session_id=session_obj.id,
-                scan_number=window.scan_number,
-                segment_start_seconds=window.start_seconds,
-                segment_duration_seconds=window.duration_seconds,
+
+                attendance_date=
+                    current_date,
+
+                scan_number=
+                    window.scan_number,
+
+                segment_start_seconds=
+                    window.start_seconds,
+
+                segment_duration_seconds=
+                    window.duration_seconds,
+
                 priority=priority,
+
                 status=STATUS_WAITING,
+
                 attempts=0,
+
                 eligible_at=eligible_at,
             )
 

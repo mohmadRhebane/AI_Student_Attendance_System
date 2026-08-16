@@ -127,7 +127,7 @@ runtime:
   active_gallery: data/generated/face_gallery_calibrated.npz
   provider: cuda
   #provider: cpu
-  allow_cpu_fallback: true
+  allow_cpu_fallback: false
   device_id: 0
 
 

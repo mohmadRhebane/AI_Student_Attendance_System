@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, Request, Form
 from app.services.attendance_ai import run_attendance_video
-from app.services.immediate_scan_service import run_immediate_three_scan_batch
+#from app.services.immediate_scan_service import run_immediate_three_scan_batch
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select, and_,delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,101 +29,555 @@ from pathlib import Path
 from fastapi import File, UploadFile
 
 from app.models.videos import Video
+
+
+from datetime import date
+
+from app.config import (
+    SCHEDULER_ENABLED,
+)
+
+from app.enums import AttendanceMode
+
+from app.models.system_setting import (
+    SystemSetting,
+)
+
+from app.services.immediate_scan_service import (
+    run_immediate_scan_batch,
+)
+
+
 router = APIRouter(prefix="/supervisor/manage/session", tags=["Supervisors Manage Session"])
+
+
+# =============================================================
+# GET ALL SESSIONS FOR CURRENT SUPERVISOR
+# =============================================================
+
+@router.get("/get-sessions")
+async def get_sessions(
+    db_session: AsyncSession = Depends(get_session),
+    current_supervisor: Supervisor = Depends(
+        get_current_supervisor
+    ),
+):
+    result = await db_session.execute(
+        select(Session)
+        .join(
+            Classroom,
+            Classroom.id == Session.classroom_id,
+        )
+        .where(
+            Classroom.supervisor_id
+            == current_supervisor.id
+        )
+        .order_by(
+            Session.classroom_id.asc(),
+            Session.date.asc(),
+            Session.start_time.asc(),
+        )
+    )
+
+    sessions = result.scalars().all()
+
+    return success_response(
+        message="Sessions retrieved successfully",
+        data=sessions,
+    )
+
+
+# =============================================================
+# GET CLASSROOM SESSIONS
+# =============================================================
+
+@router.get(
+    "/get-sessions/{classroom_id}"
+)
+async def get_classroom_sessions(
+    classroom_id: int,
+    db_session: AsyncSession = Depends(get_session),
+    current_supervisor: Supervisor = Depends(
+        get_current_supervisor
+    ),
+):
+    # ---------------------------------------------------------
+    # Verify classroom ownership
+    # ---------------------------------------------------------
+
+    classroom_result = await db_session.execute(
+        select(Classroom).where(
+            Classroom.id == classroom_id,
+            Classroom.supervisor_id
+            == current_supervisor.id,
+        )
+    )
+
+    classroom = (
+        classroom_result.scalar_one_or_none()
+    )
+
+    if classroom is None:
+        raise AppException(
+            status_code=404,
+            message=(
+                "Classroom not found or you are "
+                "not authorized to access it."
+            ),
+        )
+
+    # ---------------------------------------------------------
+    # Get sessions
+    # ---------------------------------------------------------
+
+    result = await db_session.execute(
+        select(Session)
+        .where(
+            Session.classroom_id
+            == classroom_id
+        )
+        .order_by(
+            Session.date.asc(),
+            Session.start_time.asc(),
+        )
+    )
+
+    sessions = result.scalars().all()
+
+    return success_response(
+        message="Classroom sessions retrieved successfully",
+        data=sessions,
+    )
+
+
+# =============================================================
+# GET ONE SESSION
+# =============================================================
+
+@router.get(
+    "/get-session/{session_id}"
+)
+async def get_session_by_id(
+    session_id: int,
+    db_session: AsyncSession = Depends(get_session),
+    current_supervisor: Supervisor = Depends(
+        get_current_supervisor
+    ),
+):
+    result = await db_session.execute(
+        select(Session)
+        .join(
+            Classroom,
+            Classroom.id == Session.classroom_id,
+        )
+        .where(
+            Session.id == session_id,
+            Classroom.supervisor_id
+            == current_supervisor.id,
+        )
+    )
+
+    session_obj = result.scalar_one_or_none()
+
+    if session_obj is None:
+        raise AppException(
+            status_code=404,
+            message=(
+                "Session not found or you are "
+                "not authorized to access it."
+            ),
+        )
+
+    return success_response(
+        message="Session retrieved successfully",
+        data=session_obj,
+    )
+
 
 
 @router.post("/create-session")
 async def create_session(
-        session_data: SessionCreate,
-        db_session: AsyncSession = Depends(get_session),
-        current_supervisor: Supervisor = Depends(get_current_supervisor),
+    session_data: SessionCreate,
+    db_session: AsyncSession = Depends(get_session),
+    current_supervisor: Supervisor = Depends(
+        get_current_supervisor
+    ),
 ):
-    if session_data.end_time <= session_data.start_time:
-        raise AppException(status_code=400, message="End time must be after start time.")
+    # =========================================================
+    # Classroom ownership
+    # =========================================================
 
-    classroom_query = select(Classroom).where(Classroom.id == session_data.classroom_id)
-    classroom_result = await db_session.execute(classroom_query)
-    classroom = classroom_result.scalar_one_or_none()
-
-    if not classroom:
-        raise AppException(status_code=404, message="Classroom not found.")
-
-    if classroom.supervisor_id != current_supervisor.id:
-        raise AppException(
-            status_code=403,
-            message="You are not authorized to create a session for this classroom."
-        )
-
-    overlap_query = select(Session).where(
-        and_(
-            Session.classroom_id == session_data.classroom_id,
-            Session.date == session_data.date,
-            Session.name == session_data.name,
-            Session.start_time < session_data.end_time,
-            Session.end_time > session_data.start_time
+    classroom_result = await db_session.execute(
+        select(Classroom).where(
+            Classroom.id
+            == session_data.classroom_id,
+            Classroom.supervisor_id
+            == current_supervisor.id,
         )
     )
-    overlap_result = await db_session.execute(overlap_query)
-    existing_session = overlap_result.scalar_one_or_none()
 
-    if existing_session:
+    classroom = (
+        classroom_result.scalar_one_or_none()
+    )
+
+    if classroom is None:
+        raise AppException(
+            status_code=404,
+            message=(
+                "Classroom not found or you are "
+                "not authorized to access it."
+            ),
+        )
+
+    # =========================================================
+    # Time validation
+    # =========================================================
+
+    if (
+        session_data.end_time
+        <= session_data.start_time
+    ):
+        raise AppException(
+            status_code=422,
+            message=(
+                "End time must be after start time."
+            ),
+        )
+
+    # =========================================================
+    # Prevent ANY overlap
+    # =========================================================
+
+    overlap_result = await db_session.execute(
+        select(Session).where(
+            Session.classroom_id
+            == session_data.classroom_id,
+
+            Session.date
+            == session_data.date,
+
+            Session.start_time
+            < session_data.end_time,
+
+            Session.end_time
+            > session_data.start_time,
+        )
+    )
+
+    overlapping_session = (
+        overlap_result.scalar_one_or_none()
+    )
+
+    if overlapping_session:
         raise AppException(
             status_code=409,
-            message="A session already exists in this classroom during the specified time."
+            message=(
+                "Another session already exists "
+                "in this classroom during this time."
+            ),
         )
 
-    new_session = Session(**session_data.model_dump(exclude_unset=True))
-    db_session.add(new_session)
-    await db_session.commit()
-    await db_session.refresh(new_session)
+    # =========================================================
+    # Create
+    # =========================================================
 
-    return success_response(message="Session created successfully", data=new_session)
-
-
-@router.patch("/update-session/{session_id}")
-async def update_session(
-        session_id: int,
-        session_data: SessionUpdate,
-        db_session: AsyncSession = Depends(get_session),
-        current_supervisor: Supervisor = Depends(get_current_supervisor),
-):
-    query = (
-        select(Session)
-        .options(selectinload(Session.classroom))
-        .where(Session.id == session_id)
+    new_session = Session(
+        **session_data.model_dump()
     )
-    result = await db_session.execute(query)
-    session = result.scalar_one_or_none()
 
-    if not session:
-        raise AppException(status_code=404, message="Session not found.")
+    db_session.add(new_session)
 
-    if current_supervisor.id != session.classroom.supervisor_id:
-        raise AppException(status_code=403, message="You are not authorized to update this classroom.")
+    try:
 
-    update_class = session_data.model_dump(exclude_unset=True)
-    for key, value in update_class.items():
-        setattr(session, key, value)
+        await db_session.commit()
+        await db_session.refresh(
+            new_session
+        )
 
-    await db_session.commit()
-    await db_session.refresh(session)
-    return success_response(message="Session updated successfully", data=jsonable_encoder(session, exclude={"classroom"}))
+    except Exception as exc:
 
+        await db_session.rollback()
 
-@router.delete("/delete-session/{session_id}")
-async def delete_session(
-        session_id: int,
-        db_session: AsyncSession = Depends(get_session),
-        current_supervisor: Supervisor = Depends(get_current_supervisor),
+        raise AppException(
+            status_code=500,
+            message=(
+                "Failed to create session: "
+                f"{str(exc)}"
+            ),
+        )
+
+    return success_response(
+        message="Session created successfully",
+        data=new_session,
+    )
+
+@router.patch(
+    "/update-session/{session_id}"
+)
+async def update_session(
+    session_id: int,
+    session_data: SessionUpdate,
+    db_session: AsyncSession = Depends(get_session),
+    current_supervisor: Supervisor = Depends(
+        get_current_supervisor
+    ),
 ):
-    query = select(Session).where(Session.id == session_id)
-    result = await db_session.execute(query)
-    session = result.scalar_one_or_none()
-    if not session:
-        raise AppException(status_code=404, message="Session not found.")
-    await db_session.delete(session)
-    await db_session.commit()
-    return success_response(message="Session deleted successfully", data=None)
+    # =========================================================
+    # Get session + ownership
+    # =========================================================
+
+    result = await db_session.execute(
+        select(Session)
+        .join(
+            Classroom,
+            Classroom.id == Session.classroom_id,
+        )
+        .where(
+            Session.id == session_id,
+            Classroom.supervisor_id
+            == current_supervisor.id,
+        )
+    )
+
+    session_obj = (
+        result.scalar_one_or_none()
+    )
+
+    if session_obj is None:
+        raise AppException(
+            status_code=404,
+            message=(
+                "Session not found or you are "
+                "not authorized to modify it."
+            ),
+        )
+
+    update_data = (
+        session_data.model_dump(
+            exclude_unset=True
+        )
+    )
+
+    if not update_data:
+        raise AppException(
+            status_code=400,
+            message="No fields were provided.",
+        )
+
+    # =========================================================
+    # Effective final values
+    # =========================================================
+
+    classroom_id = update_data.get(
+        "classroom_id",
+        session_obj.classroom_id,
+    )
+
+    date_value = update_data.get(
+        "date",
+        session_obj.date,
+    )
+
+    start_time = update_data.get(
+        "start_time",
+        session_obj.start_time,
+    )
+
+    end_time = update_data.get(
+        "end_time",
+        session_obj.end_time,
+    )
+
+    # =========================================================
+    # Check classroom
+    # =========================================================
+
+    classroom_result = await db_session.execute(
+        select(Classroom).where(
+            Classroom.id == classroom_id,
+            Classroom.supervisor_id
+            == current_supervisor.id,
+        )
+    )
+
+    if (
+        classroom_result.scalar_one_or_none()
+        is None
+    ):
+        raise AppException(
+            status_code=403,
+            message=(
+                "You are not authorized to use "
+                "this classroom."
+            ),
+        )
+
+    # =========================================================
+    # Validate final times
+    # =========================================================
+
+    if end_time <= start_time:
+        raise AppException(
+            status_code=422,
+            message=(
+                "End time must be after start time."
+            ),
+        )
+
+    # =========================================================
+    # Check overlap except current session
+    # =========================================================
+
+    overlap_result = await db_session.execute(
+        select(Session).where(
+            Session.id != session_id,
+
+            Session.classroom_id
+            == classroom_id,
+
+            Session.date
+            == date_value,
+
+            Session.start_time
+            < end_time,
+
+            Session.end_time
+            > start_time,
+        )
+    )
+
+    if (
+        overlap_result.scalar_one_or_none()
+        is not None
+    ):
+        raise AppException(
+            status_code=409,
+            message=(
+                "Another session already exists "
+                "during this time."
+            ),
+        )
+
+    # =========================================================
+    # Name validation
+    # =========================================================
+
+    if "name" in update_data:
+
+        name = (
+            update_data["name"]
+            or ""
+        ).strip()
+
+        if len(name) < 2:
+            raise AppException(
+                status_code=422,
+                message="Session name is too short.",
+            )
+
+        update_data["name"] = name
+
+    # =========================================================
+    # Update
+    # =========================================================
+
+    try:
+
+        for key, value in (
+            update_data.items()
+        ):
+            setattr(
+                session_obj,
+                key,
+                value,
+            )
+
+        await db_session.commit()
+
+        await db_session.refresh(
+            session_obj
+        )
+
+    except Exception as exc:
+
+        await db_session.rollback()
+
+        raise AppException(
+            status_code=500,
+            message=(
+                "Failed to update session: "
+                f"{str(exc)}"
+            ),
+        )
+
+    return success_response(
+        message="Session updated successfully",
+        data=session_obj,
+    )
+
+@router.delete(
+    "/delete-session/{session_id}"
+)
+async def delete_session(
+    session_id: int,
+    db_session: AsyncSession = Depends(get_session),
+    current_supervisor: Supervisor = Depends(
+        get_current_supervisor
+    ),
+):
+    result = await db_session.execute(
+        select(Session)
+        .join(
+            Classroom,
+            Classroom.id == Session.classroom_id,
+        )
+        .where(
+            Session.id == session_id,
+            Classroom.supervisor_id
+            == current_supervisor.id,
+        )
+    )
+
+    session_obj = (
+        result.scalar_one_or_none()
+    )
+
+    if session_obj is None:
+        raise AppException(
+            status_code=404,
+            message=(
+                "Session not found or you are "
+                "not authorized to delete it."
+            ),
+        )
+
+    try:
+
+        await db_session.delete(
+            session_obj
+        )
+
+        await db_session.commit()
+
+    except Exception:
+
+        await db_session.rollback()
+
+        raise AppException(
+            status_code=409,
+            message=(
+                "Cannot delete this session "
+                "because attendance or other "
+                "data is associated with it."
+            ),
+        )
+
+    return success_response(
+        message="Session deleted successfully",
+        data={
+            "session_id": session_id,
+        },
+    )
 
 
 
@@ -270,122 +724,401 @@ async def run_ai_attendance(
             message=str(e),
         )
 
+#لااعرف اذا كانت هذه الداله صحيحه ام التي تحتها صحيحه لم افهم منطق التعديل
+# @router.get("/{session_id}/attendance")
+# async def get_session_attendance(
+#         session_id: int,
+#         db_session: AsyncSession = Depends(get_session),
+#         current_supervisor: Supervisor = Depends(get_current_supervisor),
+# ):
+#     # ---------------------------------------------------------
+#     # 1. Verify that the session belongs to this supervisor
+#     # ---------------------------------------------------------
+#     session_result = await db_session.execute(
+#         select(Session)
+#         .join(
+#             Classroom,
+#             Classroom.id == Session.classroom_id,
+#         )
+#         .where(
+#             Session.id == session_id,
+#             Classroom.supervisor_id == current_supervisor.id,
+#         )
+#     )
 
-@router.get("/{session_id}/attendance")
+#     session_obj = session_result.scalar_one_or_none()
+
+#     if session_obj is None:
+#         raise AppException(
+#             status_code=404,
+#             message="Session not found or you are not authorized to access it.",
+#         )
+
+#     # ---------------------------------------------------------
+#     # 2. Read scan progress
+#     # ---------------------------------------------------------
+#     scheduler_result = await db_session.execute(
+#         select(SchedulerLog).where(
+#             SchedulerLog.session_id == session_id
+#         )
+#     )
+
+#     scheduler_log = scheduler_result.scalars().first()
+
+#     if scheduler_log is not None:
+#         scan_count = int(scheduler_log.scan_count or 0)
+#         max_scans = int(scheduler_log.scan_session_count or 0)
+#     else:
+#         scan_count = 0
+#         max_scans = 0
+
+#     finalized = (
+#         max_scans > 0
+#         and scan_count >= max_scans
+#     )
+
+#     # ---------------------------------------------------------
+#     # 3. Read final attendance records
+#     # ---------------------------------------------------------
+#     attendance_result = await db_session.execute(
+#         select(
+#             AttendanceRecord,
+#             Student,
+#         )
+#         .join(
+#             Student,
+#             Student.id == AttendanceRecord.student_id,
+#         )
+#         .where(
+#             AttendanceRecord.session_id == session_id
+#         )
+#         .order_by(Student.id)
+#     )
+
+#     rows = attendance_result.all()
+
+#     students = []
+
+#     for record, student in rows:
+#         status_value = getattr(
+#             record.status,
+#             "value",
+#             record.status,
+#         )
+
+#         students.append(
+#             {
+#                 "student_id": int(student.id),
+#                 "full_name": f"{student.first_name} {student.last_name}",
+#                 "status": str(status_value).lower(),
+#                 "confidence_score": (
+#                     float(record.confidence_score)
+#                     if record.confidence_score is not None
+#                     else None
+#                 ),
+#                 "manually_modified": bool(
+#                     record.manually_modified
+#                 ),
+#                 "notes": record.notes,
+#             }
+#         )
+
+#     return success_response(
+#         message="Session attendance retrieved successfully",
+#         data={
+#             "session_id": session_id,
+#             "scan_count": scan_count,
+#             "max_scans": max_scans,
+#             "finalized": finalized,
+#             "students_count": len(students),
+#             "students": students,
+#         },
+#     )
+
+
+
+@router.get(
+    "/{session_id}/runs/"
+    "{attendance_date}/attendance"
+)
 async def get_session_attendance(
-        session_id: int,
-        db_session: AsyncSession = Depends(get_session),
-        current_supervisor: Supervisor = Depends(get_current_supervisor),
+    session_id: int,
+    attendance_date: date,
+
+    db_session: AsyncSession = Depends(
+        get_session
+    ),
+
+    current_supervisor: Supervisor = Depends(
+        get_current_supervisor
+    ),
 ):
-    # ---------------------------------------------------------
-    # 1. Verify that the session belongs to this supervisor
-    # ---------------------------------------------------------
+    # ==========================================
+    # Session ownership
+    # ==========================================
+
     session_result = await db_session.execute(
         select(Session)
         .join(
             Classroom,
-            Classroom.id == Session.classroom_id,
+            Classroom.id
+            == Session.classroom_id,
         )
         .where(
             Session.id == session_id,
-            Classroom.supervisor_id == current_supervisor.id,
+
+            Classroom.supervisor_id
+            == current_supervisor.id,
         )
     )
 
-    session_obj = session_result.scalar_one_or_none()
+    session_obj = (
+        session_result.scalar_one_or_none()
+    )
 
     if session_obj is None:
         raise AppException(
             status_code=404,
-            message="Session not found or you are not authorized to access it.",
+            message=(
+                "Session not found "
+                "or not authorized."
+            ),
         )
 
-    # ---------------------------------------------------------
-    # 2. Read scan progress
-    # ---------------------------------------------------------
-    scheduler_result = await db_session.execute(
-        select(SchedulerLog).where(
-            SchedulerLog.session_id == session_id
+    # ==========================================
+    # Settings
+    # ==========================================
+
+    settings_result = await db_session.execute(
+        select(SystemSetting)
+    )
+
+    settings = (
+        settings_result.scalars().first()
+    )
+
+    configured_max_scans = (
+        int(settings.times_per_session)
+        if settings
+        else 0
+    )
+
+    # ==========================================
+    # Scan progress for this date
+    # ==========================================
+
+    scheduler_result = (
+        await db_session.execute(
+            select(SchedulerLog).where(
+                SchedulerLog.session_id
+                == session_id,
+
+                SchedulerLog.attendance_date
+                == attendance_date,
+            )
         )
     )
 
-    scheduler_log = scheduler_result.scalars().first()
+    scheduler_log = (
+        scheduler_result.scalars().first()
+    )
 
-    if scheduler_log is not None:
-        scan_count = int(scheduler_log.scan_count or 0)
-        max_scans = int(scheduler_log.scan_session_count or 0)
+    if scheduler_log:
+
+        scan_count = int(
+            scheduler_log.scan_count
+            or 0
+        )
+
+        max_scans = int(
+            scheduler_log
+            .scan_session_count
+            or configured_max_scans
+        )
+
     else:
-        scan_count = 0
-        max_scans = 0
 
-    finalized = (
+        scan_count = 0
+        max_scans = (
+            configured_max_scans
+        )
+
+    finalized = bool(
         max_scans > 0
         and scan_count >= max_scans
     )
 
-    # ---------------------------------------------------------
-    # 3. Read final attendance records
-    # ---------------------------------------------------------
-    attendance_result = await db_session.execute(
-        select(
-            AttendanceRecord,
-            Student,
-        )
-        .join(
-            Student,
-            Student.id == AttendanceRecord.student_id,
-        )
+    # ==========================================
+    # Full active roster
+    # ==========================================
+
+    roster_result = await db_session.execute(
+        select(Student)
         .where(
-            AttendanceRecord.session_id == session_id
+            Student.classroom_id
+            == session_obj.classroom_id,
+
+            Student.is_active.is_(True),
         )
-        .order_by(Student.id)
+        .order_by(Student.id.asc())
     )
 
-    rows = attendance_result.all()
+    roster = (
+        roster_result.scalars().all()
+    )
+
+    # ==========================================
+    # Existing records
+    # ==========================================
+
+    records_result = await db_session.execute(
+        select(AttendanceRecord).where(
+            AttendanceRecord.session_id
+            == session_id,
+
+            AttendanceRecord.attendance_date
+            == attendance_date,
+        )
+    )
+
+    records = {
+        int(record.student_id): record
+        for record
+        in records_result.scalars().all()
+    }
 
     students = []
 
-    for record, student in rows:
-        status_value = getattr(
-            record.status,
-            "value",
-            record.status,
+    present_count = 0
+    absent_count = 0
+    late_count = 0
+    pending_count = 0
+
+    for student in roster:
+
+        record = records.get(
+            int(student.id)
         )
+
+        if record is None:
+
+            status = "pending"
+
+            confidence = None
+
+            manually_modified = False
+
+            notes = None
+
+            pending_count += 1
+
+        else:
+
+            status_value = getattr(
+                record.status,
+                "value",
+                record.status,
+            )
+
+            status = str(
+                status_value
+            ).lower()
+
+            confidence = (
+                float(
+                    record.confidence_score
+                )
+                if (
+                    record.confidence_score
+                    is not None
+                )
+                else None
+            )
+
+            manually_modified = bool(
+                record.manually_modified
+            )
+
+            notes = record.notes
+
+            if status == "present":
+                present_count += 1
+
+            elif status == "absent":
+                absent_count += 1
+
+            elif status == "late":
+                late_count += 1
 
         students.append(
             {
-                "student_id": int(student.id),
-                "full_name": f"{student.first_name} {student.last_name}",
-                "status": str(status_value).lower(),
-                "confidence_score": (
-                    float(record.confidence_score)
-                    if record.confidence_score is not None
-                    else None
-                ),
-                "manually_modified": bool(
-                    record.manually_modified
-                ),
-                "notes": record.notes,
+                "student_id":
+                    int(student.id),
+
+                "full_name":
+                    (
+                        f"{student.first_name} "
+                        f"{student.last_name}"
+                    ).strip(),
+
+                "status":
+                    status,
+
+                "confidence_score":
+                    confidence,
+
+                "manually_modified":
+                    manually_modified,
+
+                "notes":
+                    notes,
             }
         )
 
     return success_response(
-        message="Session attendance retrieved successfully",
+        message=(
+            "Session attendance "
+            "retrieved successfully"
+        ),
         data={
-            "session_id": session_id,
-            "scan_count": scan_count,
-            "max_scans": max_scans,
-            "finalized": finalized,
-            "students_count": len(students),
-            "students": students,
+            "session_id":
+                session_id,
+
+            "attendance_date":
+                attendance_date
+                .isoformat(),
+
+            "scan_count":
+                scan_count,
+
+            "max_scans":
+                max_scans,
+
+            "finalized":
+                finalized,
+
+            "students_count":
+                len(students),
+
+            "present_count":
+                present_count,
+
+            "absent_count":
+                absent_count,
+
+            "late_count":
+                late_count,
+
+            "pending_count":
+                pending_count,
+
+            "students":
+                students,
         },
     )
 
 
-
-
-
-@router.patch("/{session_id}/attendance/{student_id}")
+@router.patch("/{session_id}/runs/{attendance_date}/attendance/{student_id}")
 async def update_attendance_manually(
         session_id: int,
         student_id: int,
@@ -438,10 +1171,16 @@ async def update_attendance_manually(
     # 3. Find final attendance record
     # ---------------------------------------------------------
     record_result = await db_session.execute(
-        select(AttendanceRecord).where(
-            AttendanceRecord.session_id == session_id,
-            AttendanceRecord.student_id == student_id,
-        )
+            select(AttendanceRecord).where(
+                AttendanceRecord.session_id
+                == session_id,
+
+                AttendanceRecord.attendance_date
+                == attendance_data,
+
+                AttendanceRecord.student_id
+                == student_id,
+            )
     )
 
     record = record_result.scalar_one_or_none()
@@ -451,10 +1190,30 @@ async def update_attendance_manually(
         # 4. Update existing record or create manual record
         # -----------------------------------------------------
         if record is not None:
-            record.status = attendance_data.status
-            record.manually_modified = True
-            record.notes = attendance_data.notes
+            # record.status = attendance_data.status
+            # record.manually_modified = True
+            # record.notes = attendance_data.notes
+            record = AttendanceRecord(
+                    session_id=session_id,
 
+                    attendance_date=
+                        attendance_data,
+
+                    student_id=student_id,
+
+                    supervisor_id=
+                        current_supervisor.id,
+
+                    status=
+                        attendance_data.status,
+
+                    confidence_score=None,
+
+                    manually_modified=True,
+
+                    notes=
+                        attendance_data.notes,
+                )
         else:
             record = AttendanceRecord(
                 session_id=session_id,
@@ -590,6 +1349,9 @@ async def get_scan_queue(
                 "started_at": job.started_at,
                 "finished_at": job.finished_at,
                 "error_message": job.error_message,
+                "attendance_date": (
+                job.attendance_date.isoformat()
+            ),
             }
         )
 
@@ -600,47 +1362,240 @@ async def get_scan_queue(
 
 
 
-@router.post("/{session_id}/video")
+# @router.post("/{session_id}/video")
+# async def upload_session_video(
+#     session_id: int,
+#     video_file: UploadFile = File(...),
+#     db_session: AsyncSession = Depends(get_session),
+#     current_supervisor: Supervisor = Depends(get_current_supervisor),
+# ):
+#     session_result = await db_session.execute(
+#         select(Session)
+#         .join(
+#             Classroom,
+#             Classroom.id == Session.classroom_id,
+#         )
+#         .where(
+#             Session.id == session_id,
+#             Classroom.supervisor_id == current_supervisor.id,
+#         )
+#     )
+
+#     session_obj = session_result.scalar_one_or_none()
+
+#     if session_obj is None:
+#         raise AppException(
+#             status_code=404,
+#             message="Session not found or not authorized.",
+#         )
+
+#     original_name = video_file.filename or ""
+#     suffix = Path(original_name).suffix.lower()
+
+#     allowed_extensions = {
+#         ".mp4",
+#         ".avi",
+#         ".mov",
+#         ".mkv",
+#     }
+
+#     if suffix not in allowed_extensions:
+#         raise AppException(
+#             status_code=400,
+#             message="Unsupported video format.",
+#         )
+
+#     storage_dir = (
+#         Path.cwd()
+#         / "data"
+#         / "managed"
+#         / "session_videos"
+#     ).resolve()
+
+#     storage_dir.mkdir(
+#         parents=True,
+#         exist_ok=True,
+#     )
+
+#     target_path = (
+#         storage_dir
+#         / f"session_{session_id}{suffix}"
+#     )
+
+#     temp_path = (
+#         storage_dir
+#         / f".session_{session_id}{suffix}.uploading"
+#     )
+
+#     try:
+#         await video_file.seek(0)
+
+#         def copy_video():
+#             with temp_path.open("wb") as destination:
+#                 shutil.copyfileobj(
+#                     video_file.file,
+#                     destination,
+#                     length=1024 * 1024,
+#                 )
+
+#             temp_path.replace(target_path)
+
+#         await asyncio.to_thread(
+#             copy_video
+#         )
+
+#         if (
+#             not target_path.is_file()
+#             or target_path.stat().st_size == 0
+#         ):
+#             raise RuntimeError(
+#                 "Uploaded video is empty."
+#             )
+
+#         video_result = await db_session.execute(
+#             select(Video)
+#             .where(
+#                 Video.session_id == session_id
+#             )
+#             .with_for_update()
+#         )
+
+#         existing_video = (
+#             video_result.scalars().first()
+#         )
+
+#         if existing_video is None:
+#             existing_video = Video(
+#                 session_id=session_id,
+#                 path=str(target_path),
+#             )
+
+#             db_session.add(
+#                 existing_video
+#             )
+
+#         else:
+#             existing_video.path = str(
+#                 target_path
+#             )
+
+#         await db_session.commit()
+#         await db_session.refresh(
+#             existing_video
+#         )
+
+#         return success_response(
+#             message="Session video uploaded successfully",
+#             data={
+#                 "video_id": existing_video.id,
+#                 "session_id": session_id,
+#                 "filename": target_path.name,
+#                 "size_bytes": target_path.stat().st_size,
+#             },
+#         )
+
+#     except AppException:
+#         await db_session.rollback()
+#         raise
+
+#     except Exception as exc:
+#         await db_session.rollback()
+
+#         if temp_path.exists():
+#             temp_path.unlink()
+
+#         raise AppException(
+#             status_code=500,
+#             message=f"Video upload failed: {type(exc).__name__}: {exc}",
+#         )
+
+#     finally:
+#         await video_file.close()
+
+@router.post(
+    "/{session_id}/runs/"
+    "{attendance_date}/video"
+)
 async def upload_session_video(
     session_id: int,
+    attendance_date: date,
     video_file: UploadFile = File(...),
-    db_session: AsyncSession = Depends(get_session),
-    current_supervisor: Supervisor = Depends(get_current_supervisor),
+    db_session: AsyncSession = Depends(
+        get_session
+    ),
+    current_supervisor: Supervisor = Depends(
+        get_current_supervisor
+    ),
 ):
     session_result = await db_session.execute(
         select(Session)
         .join(
             Classroom,
-            Classroom.id == Session.classroom_id,
+            Classroom.id
+            == Session.classroom_id,
         )
         .where(
             Session.id == session_id,
-            Classroom.supervisor_id == current_supervisor.id,
+
+            Classroom.supervisor_id
+            == current_supervisor.id,
         )
     )
 
-    session_obj = session_result.scalar_one_or_none()
+    session_obj = (
+        session_result.scalar_one_or_none()
+    )
 
     if session_obj is None:
         raise AppException(
             status_code=404,
-            message="Session not found or not authorized.",
+            message=(
+                "Session not found "
+                "or not authorized."
+            ),
         )
 
-    original_name = video_file.filename or ""
-    suffix = Path(original_name).suffix.lower()
+    # التاريخ يجب أن يطابق يوم البرنامج
+    day_code = [
+        "MON",
+        "TUE",
+        "WED",
+        "THU",
+        "FRI",
+        "SAT",
+        "SUN",
+    ][attendance_date.weekday()]
 
-    allowed_extensions = {
+    if day_code != session_obj.date:
+        raise AppException(
+            status_code=422,
+            message=(
+                "Attendance date does not "
+                "match the scheduled weekday."
+            ),
+        )
+
+    original_name = (
+        video_file.filename or ""
+    )
+
+    suffix = Path(
+        original_name
+    ).suffix.lower()
+
+    allowed = {
         ".mp4",
         ".avi",
         ".mov",
         ".mkv",
     }
 
-    if suffix not in allowed_extensions:
+    if suffix not in allowed:
         raise AppException(
             status_code=400,
-            message="Unsupported video format.",
+            message=(
+                "Unsupported video format."
+            ),
         )
 
     storage_dir = (
@@ -657,26 +1612,40 @@ async def upload_session_video(
 
     target_path = (
         storage_dir
-        / f"session_{session_id}{suffix}"
+        / (
+            f"session_{session_id}_"
+            f"{attendance_date.isoformat()}"
+            f"{suffix}"
+        )
     )
 
     temp_path = (
         storage_dir
-        / f".session_{session_id}{suffix}.uploading"
+        / (
+            f".session_{session_id}_"
+            f"{attendance_date.isoformat()}"
+            f"{suffix}.uploading"
+        )
     )
 
     try:
+
         await video_file.seek(0)
 
         def copy_video():
-            with temp_path.open("wb") as destination:
+            with temp_path.open(
+                "wb"
+            ) as destination:
+
                 shutil.copyfileobj(
                     video_file.file,
                     destination,
                     length=1024 * 1024,
                 )
 
-            temp_path.replace(target_path)
+            temp_path.replace(
+                target_path
+            )
 
         await asyncio.to_thread(
             copy_video
@@ -684,59 +1653,76 @@ async def upload_session_video(
 
         if (
             not target_path.is_file()
-            or target_path.stat().st_size == 0
+            or target_path.stat().st_size
+            == 0
         ):
             raise RuntimeError(
                 "Uploaded video is empty."
             )
 
-        video_result = await db_session.execute(
+        result = await db_session.execute(
             select(Video)
             .where(
-                Video.session_id == session_id
+                Video.session_id
+                == session_id,
+
+                Video.attendance_date
+                == attendance_date,
             )
             .with_for_update()
         )
 
-        existing_video = (
-            video_result.scalars().first()
+        video = (
+            result.scalars().first()
         )
 
-        if existing_video is None:
-            existing_video = Video(
+        if video is None:
+
+            video = Video(
                 session_id=session_id,
+
+                attendance_date=
+                    attendance_date,
+
                 path=str(target_path),
             )
 
-            db_session.add(
-                existing_video
-            )
+            db_session.add(video)
 
         else:
-            existing_video.path = str(
+
+            video.path = str(
                 target_path
             )
 
         await db_session.commit()
-        await db_session.refresh(
-            existing_video
-        )
+        await db_session.refresh(video)
 
         return success_response(
-            message="Session video uploaded successfully",
+            message=(
+                "Session video uploaded "
+                "successfully"
+            ),
             data={
-                "video_id": existing_video.id,
-                "session_id": session_id,
-                "filename": target_path.name,
-                "size_bytes": target_path.stat().st_size,
+                "video_id": video.id,
+                "session_id":
+                    session_id,
+
+                "attendance_date":
+                    attendance_date
+                    .isoformat(),
+
+                "filename":
+                    target_path.name,
+
+                "size_bytes":
+                    target_path
+                    .stat().st_size,
             },
         )
 
-    except AppException:
-        await db_session.rollback()
-        raise
-
     except Exception as exc:
+
         await db_session.rollback()
 
         if temp_path.exists():
@@ -744,19 +1730,84 @@ async def upload_session_video(
 
         raise AppException(
             status_code=500,
-            message=f"Video upload failed: {type(exc).__name__}: {exc}",
+            message=(
+                f"Video upload failed: "
+                f"{type(exc).__name__}: "
+                f"{exc}"
+            ),
         )
 
     finally:
+
         await video_file.close()
 
+# @router.get("/{session_id}/video")
+# async def get_session_video(
+#     session_id: int,
+#     db_session: AsyncSession = Depends(get_session),
+#     current_supervisor: Supervisor = Depends(get_current_supervisor),
+# ):
+#     result = await db_session.execute(
+#         select(
+#             Video,
+#             Session,
+#         )
+#         .join(
+#             Session,
+#             Session.id == Video.session_id,
+#         )
+#         .join(
+#             Classroom,
+#             Classroom.id == Session.classroom_id,
+#         )
+#         .where(
+#             Session.id == session_id,
+#             Classroom.supervisor_id == current_supervisor.id,
+#         )
+#     )
+
+#     row = result.first()
+
+#     if row is None:
+#         raise AppException(
+#             status_code=404,
+#             message="No video is registered for this session.",
+#         )
+
+#     video, session_obj = row
+
+#     path = Path(video.path)
+
+#     return success_response(
+#         message="Session video available",
+#         data={
+#             "video_id": video.id,
+#             "session_id": session_obj.id,
+#             "session_name": session_obj.name,
+#             "filename": path.name,
+#             "file_exists": path.is_file(),
+#             "size_bytes": (
+#                 path.stat().st_size
+#                 if path.is_file()
+#                 else None
+#             ),
+#         },
+#     )
 
 
-@router.get("/{session_id}/video")
+@router.get(
+    "/{session_id}/runs/"
+    "{attendance_date}/video"
+)
 async def get_session_video(
     session_id: int,
-    db_session: AsyncSession = Depends(get_session),
-    current_supervisor: Supervisor = Depends(get_current_supervisor),
+    attendance_date: date,
+    db_session: AsyncSession = Depends(
+        get_session
+    ),
+    current_supervisor: Supervisor = Depends(
+        get_current_supervisor
+    ),
 ):
     result = await db_session.execute(
         select(
@@ -765,15 +1816,22 @@ async def get_session_video(
         )
         .join(
             Session,
-            Session.id == Video.session_id,
+            Session.id
+            == Video.session_id,
         )
         .join(
             Classroom,
-            Classroom.id == Session.classroom_id,
+            Classroom.id
+            == Session.classroom_id,
         )
         .where(
             Session.id == session_id,
-            Classroom.supervisor_id == current_supervisor.id,
+
+            Video.attendance_date
+            == attendance_date,
+
+            Classroom.supervisor_id
+            == current_supervisor.id,
         )
     )
 
@@ -782,7 +1840,10 @@ async def get_session_video(
     if row is None:
         raise AppException(
             status_code=404,
-            message="No video is registered for this session.",
+            message=(
+                "No video is registered "
+                "for this attendance date."
+            ),
         )
 
     video, session_obj = row
@@ -793,10 +1854,23 @@ async def get_session_video(
         message="Session video available",
         data={
             "video_id": video.id,
-            "session_id": session_obj.id,
-            "session_name": session_obj.name,
-            "filename": path.name,
-            "file_exists": path.is_file(),
+
+            "session_id":
+                session_obj.id,
+
+            "session_name":
+                session_obj.name,
+
+            "attendance_date":
+                attendance_date
+                .isoformat(),
+
+            "filename":
+                path.name,
+
+            "file_exists":
+                path.is_file(),
+
             "size_bytes": (
                 path.stat().st_size
                 if path.is_file()
@@ -806,61 +1880,232 @@ async def get_session_video(
     )
 
 
-@router.post("/{session_id}/run-3-scans-now")
-async def run_three_scans_now(
-    session_id: int,
-    request: Request,
-    db_session: AsyncSession = Depends(get_session),
-    current_supervisor: Supervisor = Depends(get_current_supervisor),
+@router.get(
+    "/scheduler/status"
+)
+async def get_scheduler_status(
+    db_session: AsyncSession = Depends(
+        get_session
+    ),
+    current_supervisor: Supervisor = Depends(
+        get_current_supervisor
+    ),
 ):
-    allowed_result = await db_session.execute(
+    result = await db_session.execute(
+        select(SystemSetting)
+    )
+
+    settings = (
+        result.scalars().first()
+    )
+
+    if settings is None:
+
+        raise AppException(
+            status_code=404,
+            message=(
+                "System settings not found."
+            ),
+        )
+
+    mode = getattr(
+        settings.attendance_mode,
+        "value",
+        settings.attendance_mode,
+    )
+
+    automatic_ready = bool(
+        SCHEDULER_ENABLED
+        and settings.is_active
+        and str(mode).lower()
+        == "automatic"
+    )
+
+    return success_response(
+        message=(
+            "Scheduler status available"
+        ),
+        data={
+            "infrastructure_enabled":
+                bool(SCHEDULER_ENABLED),
+
+            "system_active":
+                bool(settings.is_active),
+
+            "attendance_mode":
+                str(mode).lower(),
+
+            "automatic_ready":
+                automatic_ready,
+
+            "times_per_session":
+                int(
+                    settings
+                    .times_per_session
+                ),
+
+            "scan_duration_seconds":
+                int(
+                    settings
+                    .scan_duration_seconds
+                ),
+
+            "min_confidence_score":
+                float(
+                    settings
+                    .min_confidence_score
+                ),
+        },
+    )
+
+@router.post(
+    "/{session_id}/runs/"
+    "{attendance_date}/run-scans-now"
+)
+async def run_scans_now(
+    session_id: int,
+    attendance_date: date,
+    request: Request,
+
+    db_session: AsyncSession = Depends(
+        get_session
+    ),
+
+    current_supervisor: Supervisor = Depends(
+        get_current_supervisor
+    ),
+):
+    # ==========================================
+    # Ownership
+    # ==========================================
+
+    result = await db_session.execute(
         select(Session.id)
         .join(
             Classroom,
-            Classroom.id == Session.classroom_id,
+            Classroom.id
+            == Session.classroom_id,
         )
         .where(
             Session.id == session_id,
+
             Classroom.supervisor_id
             == current_supervisor.id,
         )
     )
 
     allowed_session_id = (
-        allowed_result.scalars().first()
+        result.scalars().first()
     )
 
     if allowed_session_id is None:
         raise AppException(
             status_code=404,
-            message="Session not found or not authorized.",
+            message=(
+                "Session not found "
+                "or not authorized."
+            ),
         )
 
     try:
-        result = await run_immediate_three_scan_batch(
-            ai=request.app.state.ai,
-            session_id=session_id,
+
+        result = (
+            await run_immediate_scan_batch(
+                ai=request.app.state.ai,
+
+                session_id=session_id,
+
+                attendance_date=
+                    attendance_date,
+            )
+        )
+
+        return success_response(
+            message=(
+                "Manual attendance scans "
+                "completed"
+            ),
+            data=result,
         )
 
     except FileNotFoundError as exc:
+
         raise AppException(
             status_code=404,
             message=str(exc),
         )
 
     except ValueError as exc:
+
         raise AppException(
             status_code=409,
             message=str(exc),
         )
 
     except RuntimeError as exc:
+
         raise AppException(
             status_code=409,
             message=str(exc),
         )
 
-    return success_response(
-        message="Immediate 3-scan attendance completed",
-        data=result,
-    )
+
+
+# @router.post("/{session_id}/run-3-scans-now")
+# async def run_three_scans_now(
+#     session_id: int,
+#     request: Request,
+#     db_session: AsyncSession = Depends(get_session),
+#     current_supervisor: Supervisor = Depends(get_current_supervisor),
+# ):
+#     allowed_result = await db_session.execute(
+#         select(Session.id)
+#         .join(
+#             Classroom,
+#             Classroom.id == Session.classroom_id,
+#         )
+#         .where(
+#             Session.id == session_id,
+#             Classroom.supervisor_id
+#             == current_supervisor.id,
+#         )
+#     )
+
+#     allowed_session_id = (
+#         allowed_result.scalars().first()
+#     )
+
+#     if allowed_session_id is None:
+#         raise AppException(
+#             status_code=404,
+#             message="Session not found or not authorized.",
+#         )
+
+#     try:#run_immediate_three_scan_batch
+#         result = await run_immediate_scan_batch(
+#             ai=request.app.state.ai,
+#             session_id=session_id,
+#         )
+
+#     except FileNotFoundError as exc:
+#         raise AppException(
+#             status_code=404,
+#             message=str(exc),
+#         )
+
+#     except ValueError as exc:
+#         raise AppException(
+#             status_code=409,
+#             message=str(exc),
+#         )
+
+#     except RuntimeError as exc:
+#         raise AppException(
+#             status_code=409,
+#             message=str(exc),
+#         )
+
+#     return success_response(
+#         message="Immediate 3-scan attendance completed",
+#         data=result,
+#     )

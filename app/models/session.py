@@ -32,5 +32,8 @@ class Session(Base):
     attendance_records: Mapped[List["AttendanceRecord"]] = relationship("AttendanceRecord", back_populates="session", cascade="all, delete-orphan")
     #video: Mapped["Video"] = relationship("Video", back_populates="session")
 #محمد8
-    video: Mapped[Optional["Video"]] = relationship("Video", back_populates="session", uselist=False)
+    videos: Mapped[List["Video"]] = relationship(
+    "Video",
+    back_populates="session",
+)
 #محمد8
