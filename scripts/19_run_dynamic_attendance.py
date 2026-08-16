@@ -227,7 +227,137 @@ def write_events_jsonl(path: Path, events) -> None:
 
     temporary.replace(path)
 
+#
+#
+#def draw_frame(
+#     frame,
+#     frame_result,
+# ):
+#     annotated = frame.copy()
 
+#     for track in frame_result.tracks:
+
+#         x1, y1, x2, y2 = [
+#             int(round(value))
+#             for value in track.bbox
+#         ]
+
+#         status = getattr(
+#             track.status,
+#             "value",
+#             str(track.status),
+#         )
+
+#         # ======================================
+#         # Label
+#         # ======================================
+
+#         if track.student_id:
+
+#             name = (
+#                 track.full_name
+#                 or track.student_id
+#             )
+
+#             label = (
+#                 f"{track.student_id}"
+#                 f" | {name}"
+#                 f" | {track.score:.2f}"
+#             )
+
+#         else:
+
+#             label = (
+#                 f"{status}"
+#                 f" | {track.score:.2f}"
+#             )
+
+#         # ======================================
+#         # BBox
+#         # ======================================
+
+#         cv2.rectangle(
+#             annotated,
+#             (x1, y1),
+#             (x2, y2),
+#             (255, 255, 255),
+#             2,
+#         )
+
+#         # ======================================
+#         # Background for label
+#         # ======================================
+
+#         font = (
+#             cv2.FONT_HERSHEY_SIMPLEX
+#         )
+
+#         font_scale = 0.55
+#         thickness = 2
+
+#         (
+#             text_width,
+#             text_height,
+#         ), baseline = (
+#             cv2.getTextSize(
+#                 label,
+#                 font,
+#                 font_scale,
+#                 thickness,
+#             )
+#         )
+
+#         label_y = max(
+#             y1 - 10,
+#             text_height + 10,
+#         )
+
+#         cv2.rectangle(
+#             annotated,
+
+#             (
+#                 x1,
+#                 label_y
+#                 - text_height
+#                 - 8,
+#             ),
+
+#             (
+#                 x1
+#                 + text_width
+#                 + 10,
+
+#                 label_y
+#                 + baseline,
+#             ),
+
+#             (0, 0, 0),
+
+#             -1,
+#         )
+
+#         cv2.putText(
+#             annotated,
+#             label,
+
+#             (
+#                 x1 + 5,
+#                 label_y - 3,
+#             ),
+
+#             font,
+#             font_scale,
+
+#             (255, 255, 255),
+
+#             thickness,
+
+#             cv2.LINE_AA,
+#         )
+
+#     return annotated
+#
+#
 def draw_frame(frame, frame_result):
     annotated = frame.copy()
 

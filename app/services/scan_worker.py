@@ -15,7 +15,17 @@ from app.models.session import Session
 from app.models.videos import Video
 from app.services.attendance_scan_service import process_attendance_scan
 from app.services.video_segment_service import extract_video_segment
+from datetime import (
+    date,
+    datetime,
+    timezone,
+)
 
+from app.enums import AttendanceMode
+
+from app.models.system_setting import (
+    SystemSetting,
+)
 
 STATUS_WAITING = "WAITING"
 STATUS_PENDING = "PENDING"
@@ -27,22 +37,28 @@ STATUS_CANCELLED = "CANCELLED"
 
 @dataclass(frozen=True)
 class ClaimedScanJob:
+
     job_id: int
     session_id: int
+    attendance_date: date
     scan_number: int
+
     priority: int
+
     segment_start_seconds: int
     segment_duration_seconds: int
-    attempts: int
 
+    attempts: int
+    
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
 async def claim_next_scan_job(
-    allowed_session_ids: Optional[Sequence[int]] = None,
-) -> Optional[ClaimedScanJob]:
+    allowed_session_ids=None,
+    allowed_attendance_date=None,
+):
     async with AsyncSessionLocal() as db:
         try:
             query = (
@@ -70,6 +86,11 @@ async def claim_next_scan_job(
                     ScanJob.session_id.in_(
                         normalized_ids
                     )
+                )
+            if allowed_attendance_date is not None:
+                query = query.where(
+                    ScanJob.attendance_date
+                    == allowed_attendance_date
                 )
 
             query = (
@@ -110,16 +131,23 @@ async def claim_next_scan_job(
             claimed = ClaimedScanJob(
                 job_id=int(job.id),
                 session_id=int(job.session_id),
+
+                attendance_date=
+                    job.attendance_date,
+
                 scan_number=int(job.scan_number),
                 priority=int(job.priority),
+
                 segment_start_seconds=int(
                     job.segment_start_seconds
                 ),
+
                 segment_duration_seconds=int(
                     job.segment_duration_seconds
                 ),
+
                 attempts=int(job.attempts),
-            )
+    )
 
             await db.commit()
 
@@ -144,20 +172,30 @@ async def claim_next_scan_job(
 
 async def _get_video_path(
     session_id: int,
-) -> Path:
+    attendance_date: date,
+):
+
     async with AsyncSessionLocal() as db:
+
         result = await db.execute(
-            select(Video)
-            .where(
-                Video.session_id == session_id
+            select(Video).where(
+                Video.session_id
+                == session_id,
+
+                Video.attendance_date
+                == attendance_date,
             )
         )
 
-        video = result.scalar_one_or_none()
+        video = (
+            result.scalar_one_or_none()
+        )
 
         if video is None:
             raise FileNotFoundError(
-                f"No video is registered for session {session_id}."
+                "No video is registered "
+                f"for session {session_id} "
+                f"on {attendance_date}."
             )
 
         source_path = Path(
@@ -170,11 +208,14 @@ async def _get_video_path(
                 / source_path
             )
 
-        source_path = source_path.resolve()
+        source_path = (
+            source_path.resolve()
+        )
 
         if not source_path.is_file():
             raise FileNotFoundError(
-                f"Session video does not exist: {source_path}"
+                "Session video does not "
+                f"exist: {source_path}"
             )
 
         return source_path
@@ -185,11 +226,13 @@ async def _check_job_sequence(
 ) -> bool:
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            select(SchedulerLog)
-            .where(
-                SchedulerLog.session_id
-                == job.session_id
-            )
+           select(SchedulerLog).where(
+            SchedulerLog.session_id
+            == job.session_id,
+
+            SchedulerLog.attendance_date
+            == job.attendance_date,
+        )
         )
 
         scheduler_log = (
@@ -326,7 +369,8 @@ async def execute_claimed_scan_job(
             }
 
         source_path = await _get_video_path(
-            job.session_id
+            job.session_id,
+            job.attendance_date
         )
 
         with tempfile.TemporaryDirectory(
@@ -374,6 +418,7 @@ async def execute_claimed_scan_job(
                         expected_scan_number=(
                             job.scan_number
                         ),
+                        attendance_date=job.attendance_date,
                     )
                 )
 
@@ -440,25 +485,75 @@ async def execute_claimed_scan_job(
         }
 
 
+async def _automatic_worker_enabled():
+    async with AsyncSessionLocal() as db:
+
+        result = await db.execute(
+            select(SystemSetting)
+        )
+
+        setting = (
+            result.scalars().first()
+        )
+
+        return bool(
+            setting
+            and setting.is_active
+            and (
+                setting.attendance_mode
+                == AttendanceMode.AUTOMATIC
+            )
+        )
+
+
+
 async def run_one_scan_job(
     ai,
-    allowed_session_ids: Optional[Sequence[int]] = None,
-) -> Dict[str, Any]:
+    allowed_session_ids=None,
+    allowed_attendance_date=None,
+):
+
     job = await claim_next_scan_job(
-        allowed_session_ids=allowed_session_ids
+        allowed_session_ids=
+            allowed_session_ids,
+
+        allowed_attendance_date=
+            allowed_attendance_date,
     )
 
     if job is None:
         return {
             "found": False,
             "succeeded": False,
-            "message": "No pending scan jobs.",
+            "message":
+                "No pending scan jobs.",
         }
 
     return await execute_claimed_scan_job(
         ai=ai,
         job=job,
     )
+
+
+# async def run_one_scan_job(
+#     ai,
+#     allowed_session_ids: Optional[Sequence[int]] = None,
+# ) -> Dict[str, Any]:
+#     job = await claim_next_scan_job(
+#         allowed_session_ids=allowed_session_ids
+#     )
+
+#     if job is None:
+#         return {
+#             "found": False,
+#             "succeeded": False,
+#             "message": "No pending scan jobs.",
+#         }
+
+#     return await execute_claimed_scan_job(
+#         ai=ai,
+#         job=job,
+#     )
 
 
 async def recover_running_scan_jobs(
@@ -486,6 +581,7 @@ async def recover_running_scan_jobs(
                 )
             )
 
+
             jobs = result.scalars().all()
 
             now = _utc_now()
@@ -495,7 +591,9 @@ async def recover_running_scan_jobs(
                     select(SchedulerLog)
                     .where(
                         SchedulerLog.session_id
-                        == job.session_id
+                        == job.session_id ,
+                        SchedulerLog.attendance_date
+                            == job.attendance_date
                     )
                 )
 
@@ -561,12 +659,12 @@ async def recover_running_scan_jobs(
 
             raise
 
-
 async def scan_worker_loop(
     ai,
     stop_event: asyncio.Event,
     poll_seconds: float = 2.0,
 ) -> None:
+
     if poll_seconds <= 0:
         raise ValueError(
             "poll_seconds must be greater than zero."
@@ -577,23 +675,39 @@ async def scan_worker_loop(
     )
 
     try:
+
         while not stop_event.is_set():
+
             try:
-                result = await run_one_scan_job(
-                    ai=ai
+
+                # ==========================================
+                # Background Worker = AUTOMATIC only
+                # ==========================================
+
+                automatic_enabled = (
+                    await _automatic_worker_enabled()
                 )
 
-                if result.get("found"):
-                    # Queue may contain another job.
-                    # Continue immediately.
-                    continue
+                if automatic_enabled:
+
+                    result = (
+                        await run_one_scan_job(
+                            ai=ai
+                        )
+                    )
+
+                    if result.get("found"):
+                        continue
 
             except Exception:
+
                 logger.exception(
-                    "Unexpected error in scan worker loop"
+                    "Unexpected error in "
+                    "scan worker loop"
                 )
 
             try:
+
                 await asyncio.wait_for(
                     stop_event.wait(),
                     timeout=poll_seconds,
@@ -603,6 +717,51 @@ async def scan_worker_loop(
                 pass
 
     finally:
+
         logger.info(
             "Attendance scan worker stopped."
         )
+# async def scan_worker_loop(
+#     ai,
+#     stop_event: asyncio.Event,
+#     poll_seconds: float = 2.0,
+# ) -> None:
+#     if poll_seconds <= 0:
+#         raise ValueError(
+#             "poll_seconds must be greater than zero."
+#         )
+
+#     logger.info(
+#         "Attendance scan worker started."
+#     )
+
+#     try:
+#         while not stop_event.is_set():
+#             try:
+#                 result = await run_one_scan_job(
+#                     ai=ai
+#                 )
+
+#                 if result.get("found"):
+#                     # Queue may contain another job.
+#                     # Continue immediately.
+#                     continue
+
+#             except Exception:
+#                 logger.exception(
+#                     "Unexpected error in scan worker loop"
+#                 )
+
+#             try:
+#                 await asyncio.wait_for(
+#                     stop_event.wait(),
+#                     timeout=poll_seconds,
+#                 )
+
+#             except asyncio.TimeoutError:
+#                 pass
+
+#     finally:
+#         logger.info(
+#             "Attendance scan worker stopped."
+#         )

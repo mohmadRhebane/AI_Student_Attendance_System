@@ -1,79 +1,157 @@
 import asyncio
-from datetime import datetime, timezone
+
+from datetime import (
+    date,
+    datetime,
+    timezone,
+)
+
 from pathlib import Path
-from typing import Any, Dict, List
 
 from sqlalchemy import select
 
-from app.config import SCHEDULER_ENABLED
 from app.database import AsyncSessionLocal
-from app.models.scan_job import ScanJob
-from app.models.scheduler_logs import SchedulerLog
-from app.models.system_setting import SystemSetting
-from app.models.videos import Video
-from app.services.scan_window_service import build_scan_windows
-from app.services.scan_worker import run_one_scan_job
-from app.services.video_segment_service import get_video_duration_seconds
-from app.models.attendance_record import AttendanceRecord
-from app.enums import AttendanceStatus
 
-MANUAL_SCAN_COUNT = 3
+from app.enums import AttendanceMode
+
+from app.models.scan_job import ScanJob
+
+from app.models.scheduler_logs import (
+    SchedulerLog,
+)
+
+from app.models.system_setting import (
+    SystemSetting,
+)
+
+from app.models.videos import Video
+
+from app.services.scan_window_service import (
+    build_scan_windows,
+)
+
+from app.services.scan_worker import (
+    run_one_scan_job,
+)
+
+from app.services.video_segment_service import (
+    get_video_duration_seconds,
+)
+
 
 STATUS_WAITING = "WAITING"
 STATUS_PENDING = "PENDING"
+STATUS_RUNNING = "RUNNING"
+STATUS_FAILED = "FAILED"
 
 FINAL_SCAN_PRIORITY = 0
 NORMAL_SCAN_PRIORITY = 100
 
+
 _manual_batch_lock = asyncio.Lock()
 
 
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+def _utc_now():
+    return datetime.now(
+        timezone.utc
+    )
 
 
-async def _prepare_immediate_jobs(
+async def _prepare_manual_jobs(
     session_id: int,
-) -> List[Dict[str, Any]]:
+    attendance_date: date,
+):
+
+    # =========================================================
+    # Settings + video
+    # =========================================================
+
     async with AsyncSessionLocal() as db:
+
         settings_result = await db.execute(
             select(SystemSetting)
         )
-        settings = settings_result.scalars().first()
+
+        settings = (
+            settings_result.scalars().first()
+        )
 
         if settings is None:
             raise ValueError(
                 "System settings not found."
             )
 
-        video_result = await db.execute(
-            select(Video).where(
-                Video.session_id == session_id
+        if not settings.is_active:
+            raise ValueError(
+                "Attendance system is inactive."
             )
+
+        if (
+            settings.attendance_mode
+            != AttendanceMode.MANUAL
+        ):
+            raise ValueError(
+                "Attendance mode must be MANUAL "
+                "to run scans manually."
+            )
+
+        scan_count = int(
+            settings.times_per_session
         )
 
-        video = video_result.scalars().first()
-
-        if video is None:
-            raise FileNotFoundError(
-                f"No video is registered for session {session_id}."
-            )
-
-        video_path = Path(video.path).expanduser()
-
-        if not video_path.is_absolute():
-            video_path = Path.cwd() / video_path
-
-        video_path = video_path.resolve()
-
-        if not video_path.is_file():
-            raise FileNotFoundError(
-                f"Session video does not exist: {video_path}"
+        if not 1 <= scan_count <= 5:
+            raise ValueError(
+                "times_per_session must be "
+                "between 1 and 5."
             )
 
         scan_duration_seconds = int(
             settings.scan_duration_seconds
         )
+
+        video_result = await db.execute(
+            select(Video).where(
+                Video.session_id
+                == session_id,
+
+                Video.attendance_date
+                == attendance_date,
+            )
+        )
+
+        video = (
+            video_result.scalar_one_or_none()
+        )
+
+        if video is None:
+            raise FileNotFoundError(
+                "No video is registered "
+                f"for {attendance_date}."
+            )
+
+        video_path = Path(
+            video.path
+        ).expanduser()
+
+        if not video_path.is_absolute():
+            video_path = (
+                Path.cwd()
+                / video_path
+            )
+
+        video_path = (
+            video_path.resolve()
+        )
+
+        if not video_path.is_file():
+            raise FileNotFoundError(
+                f"Video does not exist: "
+                f"{video_path}"
+            )
+
+    # =========================================================
+    # Calculate scan windows
+    # =========================================================
 
     video_duration_seconds = int(
         await asyncio.to_thread(
@@ -83,53 +161,95 @@ async def _prepare_immediate_jobs(
     )
 
     windows = build_scan_windows(
-        video_duration_seconds=video_duration_seconds,
-        scan_count=MANUAL_SCAN_COUNT,
-        scan_duration_seconds=scan_duration_seconds,
+        video_duration_seconds=
+            video_duration_seconds,
+
+        scan_count=scan_count,
+
+        scan_duration_seconds=
+            scan_duration_seconds,
     )
 
+    # =========================================================
+    # Scheduler + Jobs
+    # =========================================================
+
     async with AsyncSessionLocal() as db:
+
         scheduler_result = await db.execute(
             select(SchedulerLog)
             .where(
-                SchedulerLog.session_id == session_id
+                SchedulerLog.session_id
+                == session_id,
+
+                SchedulerLog.attendance_date
+                == attendance_date,
             )
             .with_for_update()
         )
 
         scheduler_log = (
-            scheduler_result.scalars().first()
+            scheduler_result
+            .scalar_one_or_none()
         )
 
         if scheduler_log is None:
+
             scheduler_log = SchedulerLog(
                 session_id=session_id,
+
+                attendance_date=
+                    attendance_date,
+
                 scan_count=0,
-                scan_session_count=MANUAL_SCAN_COUNT,
+
+                scan_session_count=
+                    scan_count,
             )
 
             db.add(scheduler_log)
             await db.flush()
 
-        else:
-            current_scan_count = int(
-                scheduler_log.scan_count or 0
-            )
+        current_scan_count = int(
+            scheduler_log.scan_count
+            or 0
+        )
 
-            if current_scan_count != 0:
-                raise ValueError(
-                    "This session already contains attendance scans. "
-                    "Use a fresh session for the immediate 3-scan demo."
-                )
+        max_scans = int(
+            scheduler_log.scan_session_count
+            or scan_count
+        )
+
+        # إذا لم تبدأ الدورة بعد يمكن أخذ
+        # عدد المسحات الحالي من الإعدادات.
+        if current_scan_count == 0:
 
             scheduler_log.scan_session_count = (
-                MANUAL_SCAN_COUNT
+                scan_count
             )
+
+            max_scans = scan_count
+
+        if current_scan_count >= max_scans:
+
+            await db.commit()
+
+            return {
+                "already_completed": True,
+                "scan_count": max_scans,
+                "current_scan_count":
+                    current_scan_count,
+                "windows": windows,
+            }
 
         jobs_result = await db.execute(
             select(ScanJob)
             .where(
-                ScanJob.session_id == session_id
+                ScanJob.session_id
+                == session_id,
+
+                ScanJob.attendance_date
+                == attendance_date,
             )
             .with_for_update()
         )
@@ -138,69 +258,145 @@ async def _prepare_immediate_jobs(
             jobs_result.scalars().all()
         )
 
-        if existing_jobs:
-            raise ValueError(
-                "This session already contains ScanJobs. "
-                "Use a fresh session for the immediate 3-scan demo."
-            )
+        jobs_by_scan = {
+            int(job.scan_number): job
+            for job in existing_jobs
+        }
 
         now = _utc_now()
 
-        prepared = []
-
+        # Create missing jobs
         for window in windows:
-            is_first = window.scan_number == 1
-            is_final = (
+
+            if (
                 window.scan_number
-                == MANUAL_SCAN_COUNT
-            )
+                in jobs_by_scan
+            ):
+                continue
 
             job = ScanJob(
                 session_id=session_id,
-                scan_number=window.scan_number,
-                segment_start_seconds=window.start_seconds,
-                segment_duration_seconds=window.duration_seconds,
+
+                attendance_date=
+                    attendance_date,
+
+                scan_number=
+                    window.scan_number,
+
+                segment_start_seconds=
+                    window.start_seconds,
+
+                segment_duration_seconds=
+                    window.duration_seconds,
+
                 priority=(
                     FINAL_SCAN_PRIORITY
-                    if is_final
+                    if (
+                        window.scan_number
+                        == max_scans
+                    )
                     else NORMAL_SCAN_PRIORITY
                 ),
-                status=(
-                    STATUS_PENDING
-                    if is_first
-                    else STATUS_WAITING
-                ),
+
+                status=STATUS_WAITING,
+
                 attempts=0,
+
+                # Manual = ready immediately
                 eligible_at=now,
-                queued_at=now if is_first else None,
             )
 
             db.add(job)
 
-            prepared.append(
-                {
-                    "scan_number": window.scan_number,
-                    "start_seconds": window.start_seconds,
-                    "end_seconds": window.end_seconds,
-                    "duration_seconds": window.duration_seconds,
-                }
+            jobs_by_scan[
+                window.scan_number
+            ] = job
+
+        await db.flush()
+
+        next_scan = (
+            current_scan_count + 1
+        )
+
+        next_job = (
+            jobs_by_scan.get(next_scan)
+        )
+
+        if next_job is None:
+            raise RuntimeError(
+                "Next manual ScanJob "
+                "could not be prepared."
+            )
+
+        if next_job.status in {
+            STATUS_WAITING,
+            STATUS_FAILED,
+        }:
+            next_job.status = (
+                STATUS_PENDING
+            )
+
+            next_job.queued_at = now
+            next_job.error_message = None
+
+        elif (
+            next_job.status
+            == STATUS_RUNNING
+        ):
+            raise RuntimeError(
+                "This attendance scan is "
+                "already running."
             )
 
         await db.commit()
 
-        return prepared
+        return {
+            "already_completed": False,
+
+            "scan_count":
+                max_scans,
+
+            "current_scan_count":
+                current_scan_count,
+
+            "windows": [
+                {
+                    "scan_number":
+                        window.scan_number,
+
+                    "start_seconds":
+                        window.start_seconds,
+
+                    "duration_seconds":
+                        window.duration_seconds,
+
+                    "end_seconds":
+                        window.end_seconds,
+                }
+                for window in windows
+            ],
+        }
 
 
-async def _promote_immediate_job(
+async def _promote_manual_job(
     session_id: int,
+    attendance_date: date,
     scan_number: int,
-) -> None:
+):
+
     async with AsyncSessionLocal() as db:
+
         result = await db.execute(
             select(ScanJob)
             .where(
-                ScanJob.session_id == session_id,
-                ScanJob.scan_number == scan_number,
+                ScanJob.session_id
+                == session_id,
+
+                ScanJob.attendance_date
+                == attendance_date,
+
+                ScanJob.scan_number
+                == scan_number,
             )
             .with_for_update()
         )
@@ -209,192 +405,600 @@ async def _promote_immediate_job(
 
         if job is None:
             raise RuntimeError(
-                f"ScanJob {scan_number} not found "
-                f"for session {session_id}."
+                f"ScanJob {scan_number} "
+                "not found."
             )
 
-        job.status = STATUS_PENDING
-        job.queued_at = _utc_now()
-        job.error_message = None
+        if job.status in {
+            STATUS_WAITING,
+            STATUS_FAILED,
+        }:
+
+            job.status = STATUS_PENDING
+            job.queued_at = _utc_now()
+            job.error_message = None
+
+        elif job.status == STATUS_RUNNING:
+
+            raise RuntimeError(
+                f"Scan {scan_number} "
+                "is already running."
+            )
 
         await db.commit()
 
 
-async def _get_attendance_summary(
-    session_id: int,
-) -> Dict[str, Any]:
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(AttendanceRecord)
-            .where(
-                AttendanceRecord.session_id == session_id
-            )
-        )
-
-        records = result.scalars().all()
-
-    total_students = len(records)
-
-    present_count = sum(
-        1
-        for record in records
-        if record.status == AttendanceStatus.PRESENT
-    )
-
-    absent_count = sum(
-        1
-        for record in records
-        if record.status == AttendanceStatus.ABSENT
-    )
-
-    late_count = sum(
-        1
-        for record in records
-        if record.status == AttendanceStatus.LATE
-    )
-
-    def percentage(count: int) -> float:
-        if total_students == 0:
-            return 0.0
-
-        return round(
-            (count / total_students) * 100,
-            2,
-        )
-
-    attendance_count = (
-        present_count + late_count
-    )
-
-    return {
-        "total_students": total_students,
-        "present": {
-            "count": present_count,
-            "percentage": percentage(
-                present_count
-            ),
-        },
-        "absent": {
-            "count": absent_count,
-            "percentage": percentage(
-                absent_count
-            ),
-        },
-        "late": {
-            "count": late_count,
-            "percentage": percentage(
-                late_count
-            ),
-        },
-        "attendance_count": attendance_count,
-        "attendance_percentage": percentage(
-            attendance_count
-        ),
-        "absence_percentage": percentage(
-            absent_count
-        ),
-    }
-
-
-async def run_immediate_three_scan_batch(
+async def run_immediate_scan_batch(
     ai,
     session_id: int,
-) -> Dict[str, Any]:
-    if SCHEDULER_ENABLED:
-        raise ValueError(
-            "Immediate 3-scan demo requires "
-            "SCHEDULER_ENABLED=false."
-        )
+    attendance_date: date,
+):
 
     if _manual_batch_lock.locked():
         raise RuntimeError(
-            "Another immediate attendance batch is already running."
+            "Another manual attendance "
+            "batch is currently running."
         )
 
     async with _manual_batch_lock:
-        windows = await _prepare_immediate_jobs(
-            session_id=session_id
+
+        preparation = (
+            await _prepare_manual_jobs(
+                session_id=session_id,
+
+                attendance_date=
+                    attendance_date,
+            )
         )
+
+        max_scans = int(
+            preparation["scan_count"]
+        )
+
+        current = int(
+            preparation[
+                "current_scan_count"
+            ]
+        )
+
+        if preparation[
+            "already_completed"
+        ]:
+            return {
+                "completed": True,
+
+                "already_completed": True,
+
+                "session_id":
+                    session_id,
+
+                "attendance_date":
+                    attendance_date.isoformat(),
+
+                "scan_count":
+                    max_scans,
+
+                "results": [],
+            }
 
         results = []
 
+        # Resume is supported
         for scan_number in range(
-            1,
-            MANUAL_SCAN_COUNT + 1,
+            current + 1,
+            max_scans + 1,
         ):
-            if scan_number > 1:
-                await _promote_immediate_job(
-                    session_id=session_id,
-                    scan_number=scan_number,
-                )
 
-            worker_result = await run_one_scan_job(
-                ai=ai,
-                allowed_session_ids=[
-                    session_id
-                ],
+            await _promote_manual_job(
+                session_id=session_id,
+
+                attendance_date=
+                    attendance_date,
+
+                scan_number=
+                    scan_number,
+            )
+
+            worker_result = (
+                await run_one_scan_job(
+                    ai=ai,
+
+                    allowed_session_ids=[
+                        session_id
+                    ],
+
+                    allowed_attendance_date=
+                        attendance_date,
+                )
             )
 
             scan_result = (
-                worker_result.get("scan_result")
+                worker_result.get(
+                    "scan_result"
+                )
                 or {}
             )
 
-            compact_result = {
-                "scan_number": scan_number,
-                "succeeded": worker_result.get(
-                    "succeeded",
-                    False,
-                ),
-                "job_id": worker_result.get(
-                    "job_id"
-                ),
-                "saved_logs": scan_result.get(
-                    "saved_logs",
-                    0,
-                ),
-                "finalized": scan_result.get(
-                    "finalized",
-                    False,
-                ),
-                "records_written": scan_result.get(
-                    "records_written",
-                    0,
-                ),
-                "error": worker_result.get(
-                    "error"
-                ),
+            compact = {
+                "scan_number":
+                    scan_number,
+
+                "succeeded":
+                    bool(
+                        worker_result.get(
+                            "succeeded",
+                            False,
+                        )
+                    ),
+
+                "job_id":
+                    worker_result.get(
+                        "job_id"
+                    ),
+
+                "saved_logs":
+                    scan_result.get(
+                        "saved_logs",
+                        0,
+                    ),
+
+                "finalized":
+                    scan_result.get(
+                        "finalized",
+                        False,
+                    ),
+
+                "records_written":
+                    scan_result.get(
+                        "records_written",
+                        0,
+                    ),
+
+                "error":
+                    worker_result.get(
+                        "error"
+                    ),
             }
 
-            results.append(compact_result)
+            results.append(compact)
 
-            if not worker_result.get(
-                "succeeded",
-                False,
-            ):
+            if not compact["succeeded"]:
+
                 return {
                     "completed": False,
-                    "session_id": session_id,
-                    "scan_count": MANUAL_SCAN_COUNT,
-                    "windows": windows,
-                    "results": results,
+
+                    "session_id":
+                        session_id,
+
+                    "attendance_date":
+                        attendance_date
+                        .isoformat(),
+
+                    "scan_count":
+                        max_scans,
+
+                    "results":
+                        results,
                 }
-        attendance_summary = await _get_attendance_summary(
-            session_id=session_id
-        )
 
         return {
             "completed": True,
-            "session_id": session_id,
-            "scan_count": MANUAL_SCAN_COUNT,
-            "windows": windows,
-            "results": results,
-            "attendance_summary": attendance_summary,
+
+            "already_completed":
+                False,
+
+            "session_id":
+                session_id,
+
+            "attendance_date":
+                attendance_date.isoformat(),
+
+            "scan_count":
+                max_scans,
+
+            "windows":
+                preparation["windows"],
+
+            "results":
+                results,
         }
-        # return {
-        #     "completed": True,
-        #     "session_id": session_id,
-        #     "scan_count": MANUAL_SCAN_COUNT,
-        #     "windows": windows,
-        #     "results": results,
-        # }
+# import asyncio
+# from datetime import datetime, timezone
+# from pathlib import Path
+# from typing import Any, Dict, List
+
+# from sqlalchemy import select
+
+# from app.config import SCHEDULER_ENABLED
+# from app.database import AsyncSessionLocal
+# from app.models.scan_job import ScanJob
+# from app.models.scheduler_logs import SchedulerLog
+# from app.models.system_setting import SystemSetting
+# from app.models.videos import Video
+# from app.services.scan_window_service import build_scan_windows
+# from app.services.scan_worker import run_one_scan_job
+# from app.services.video_segment_service import get_video_duration_seconds
+# from app.models.attendance_record import AttendanceRecord
+# from app.enums import AttendanceStatus
+
+# MANUAL_SCAN_COUNT = 3
+
+# STATUS_WAITING = "WAITING"
+# STATUS_PENDING = "PENDING"
+
+# FINAL_SCAN_PRIORITY = 0
+# NORMAL_SCAN_PRIORITY = 100
+
+# _manual_batch_lock = asyncio.Lock()
+
+
+# def _utc_now() -> datetime:
+#     return datetime.now(timezone.utc)
+
+
+# async def _prepare_immediate_jobs(
+#     session_id: int,
+# ) -> List[Dict[str, Any]]:
+#     async with AsyncSessionLocal() as db:
+#         settings_result = await db.execute(
+#             select(SystemSetting)
+#         )
+#         settings = settings_result.scalars().first()
+
+#         if settings is None:
+#             raise ValueError(
+#                 "System settings not found."
+#             )
+
+#         video_result = await db.execute(
+#             select(Video).where(
+#                 Video.session_id == session_id
+#             )
+#         )
+
+#         video = video_result.scalars().first()
+
+#         if video is None:
+#             raise FileNotFoundError(
+#                 f"No video is registered for session {session_id}."
+#             )
+
+#         video_path = Path(video.path).expanduser()
+
+#         if not video_path.is_absolute():
+#             video_path = Path.cwd() / video_path
+
+#         video_path = video_path.resolve()
+
+#         if not video_path.is_file():
+#             raise FileNotFoundError(
+#                 f"Session video does not exist: {video_path}"
+#             )
+
+#         scan_duration_seconds = int(
+#             settings.scan_duration_seconds
+#         )
+
+#     video_duration_seconds = int(
+#         await asyncio.to_thread(
+#             get_video_duration_seconds,
+#             video_path,
+#         )
+#     )
+
+#     windows = build_scan_windows(
+#         video_duration_seconds=video_duration_seconds,
+#         scan_count=MANUAL_SCAN_COUNT,
+#         scan_duration_seconds=scan_duration_seconds,
+#     )
+
+#     async with AsyncSessionLocal() as db:
+#         scheduler_result = await db.execute(
+#             select(SchedulerLog)
+#             .where(
+#                 SchedulerLog.session_id == session_id
+#             )
+#             .with_for_update()
+#         )
+
+#         scheduler_log = (
+#             scheduler_result.scalars().first()
+#         )
+
+#         if scheduler_log is None:
+#             scheduler_log = SchedulerLog(
+#                 session_id=session_id,
+#                 scan_count=0,
+#                 scan_session_count=MANUAL_SCAN_COUNT,
+#             )
+
+#             db.add(scheduler_log)
+#             await db.flush()
+
+#         else:
+#             current_scan_count = int(
+#                 scheduler_log.scan_count or 0
+#             )
+
+#             if current_scan_count != 0:
+#                 raise ValueError(
+#                     "This session already contains attendance scans. "
+#                     "Use a fresh session for the immediate 3-scan demo."
+#                 )
+
+#             scheduler_log.scan_session_count = (
+#                 MANUAL_SCAN_COUNT
+#             )
+
+#         jobs_result = await db.execute(
+#             select(ScanJob)
+#             .where(
+#                 ScanJob.session_id == session_id
+#             )
+#             .with_for_update()
+#         )
+
+#         existing_jobs = (
+#             jobs_result.scalars().all()
+#         )
+
+#         if existing_jobs:
+#             raise ValueError(
+#                 "This session already contains ScanJobs. "
+#                 "Use a fresh session for the immediate 3-scan demo."
+#             )
+
+#         now = _utc_now()
+
+#         prepared = []
+
+#         for window in windows:
+#             is_first = window.scan_number == 1
+#             is_final = (
+#                 window.scan_number
+#                 == MANUAL_SCAN_COUNT
+#             )
+
+#             job = ScanJob(
+#                 session_id=session_id,
+#                 scan_number=window.scan_number,
+#                 segment_start_seconds=window.start_seconds,
+#                 segment_duration_seconds=window.duration_seconds,
+#                 priority=(
+#                     FINAL_SCAN_PRIORITY
+#                     if is_final
+#                     else NORMAL_SCAN_PRIORITY
+#                 ),
+#                 status=(
+#                     STATUS_PENDING
+#                     if is_first
+#                     else STATUS_WAITING
+#                 ),
+#                 attempts=0,
+#                 eligible_at=now,
+#                 queued_at=now if is_first else None,
+#             )
+
+#             db.add(job)
+
+#             prepared.append(
+#                 {
+#                     "scan_number": window.scan_number,
+#                     "start_seconds": window.start_seconds,
+#                     "end_seconds": window.end_seconds,
+#                     "duration_seconds": window.duration_seconds,
+#                 }
+#             )
+
+#         await db.commit()
+
+#         return prepared
+
+
+# async def _promote_immediate_job(
+#     session_id: int,
+#     scan_number: int,
+# ) -> None:
+#     async with AsyncSessionLocal() as db:
+#         result = await db.execute(
+#             select(ScanJob)
+#             .where(
+#                 ScanJob.session_id == session_id,
+#                 ScanJob.scan_number == scan_number,
+#             )
+#             .with_for_update()
+#         )
+
+#         job = result.scalar_one_or_none()
+
+#         if job is None:
+#             raise RuntimeError(
+#                 f"ScanJob {scan_number} not found "
+#                 f"for session {session_id}."
+#             )
+
+#         job.status = STATUS_PENDING
+#         job.queued_at = _utc_now()
+#         job.error_message = None
+
+#         await db.commit()
+
+
+# async def _get_attendance_summary(
+#     session_id: int,
+# ) -> Dict[str, Any]:
+#     async with AsyncSessionLocal() as db:
+#         result = await db.execute(
+#             select(AttendanceRecord)
+#             .where(
+#                 AttendanceRecord.session_id == session_id
+#             )
+#         )
+
+#         records = result.scalars().all()
+
+#     total_students = len(records)
+
+#     present_count = sum(
+#         1
+#         for record in records
+#         if record.status == AttendanceStatus.PRESENT
+#     )
+
+#     absent_count = sum(
+#         1
+#         for record in records
+#         if record.status == AttendanceStatus.ABSENT
+#     )
+
+#     late_count = sum(
+#         1
+#         for record in records
+#         if record.status == AttendanceStatus.LATE
+#     )
+
+#     def percentage(count: int) -> float:
+#         if total_students == 0:
+#             return 0.0
+
+#         return round(
+#             (count / total_students) * 100,
+#             2,
+#         )
+
+#     attendance_count = (
+#         present_count + late_count
+#     )
+
+#     return {
+#         "total_students": total_students,
+#         "present": {
+#             "count": present_count,
+#             "percentage": percentage(
+#                 present_count
+#             ),
+#         },
+#         "absent": {
+#             "count": absent_count,
+#             "percentage": percentage(
+#                 absent_count
+#             ),
+#         },
+#         "late": {
+#             "count": late_count,
+#             "percentage": percentage(
+#                 late_count
+#             ),
+#         },
+#         "attendance_count": attendance_count,
+#         "attendance_percentage": percentage(
+#             attendance_count
+#         ),
+#         "absence_percentage": percentage(
+#             absent_count
+#         ),
+#     }
+
+
+# async def run_immediate_three_scan_batch(
+#     ai,
+#     session_id: int,
+# ) -> Dict[str, Any]:
+#     if SCHEDULER_ENABLED:
+#         raise ValueError(
+#             "Immediate 3-scan demo requires "
+#             "SCHEDULER_ENABLED=false."
+#         )
+
+#     if _manual_batch_lock.locked():
+#         raise RuntimeError(
+#             "Another immediate attendance batch is already running."
+#         )
+
+#     async with _manual_batch_lock:
+#         windows = await _prepare_immediate_jobs(
+#             session_id=session_id
+#         )
+
+#         results = []
+
+#         for scan_number in range(
+#             1,
+#             MANUAL_SCAN_COUNT + 1,
+#         ):
+#             if scan_number > 1:
+#                 await _promote_immediate_job(
+#                     session_id=session_id,
+#                     scan_number=scan_number,
+#                 )
+
+#             worker_result = await run_one_scan_job(
+#                 ai=ai,
+#                 allowed_session_ids=[
+#                     session_id
+#                 ],
+#             )
+
+#             scan_result = (
+#                 worker_result.get("scan_result")
+#                 or {}
+#             )
+
+#             compact_result = {
+#                 "scan_number": scan_number,
+#                 "succeeded": worker_result.get(
+#                     "succeeded",
+#                     False,
+#                 ),
+#                 "job_id": worker_result.get(
+#                     "job_id"
+#                 ),
+#                 "saved_logs": scan_result.get(
+#                     "saved_logs",
+#                     0,
+#                 ),
+#                 "finalized": scan_result.get(
+#                     "finalized",
+#                     False,
+#                 ),
+#                 "records_written": scan_result.get(
+#                     "records_written",
+#                     0,
+#                 ),
+#                 "error": worker_result.get(
+#                     "error"
+#                 ),
+#             }
+
+#             results.append(compact_result)
+
+#             if not worker_result.get(
+#                 "succeeded",
+#                 False,
+#             ):
+#                 return {
+#                     "completed": False,
+#                     "session_id": session_id,
+#                     "scan_count": MANUAL_SCAN_COUNT,
+#                     "windows": windows,
+#                     "results": results,
+#                 }
+#         attendance_summary = await _get_attendance_summary(
+#             session_id=session_id
+#         )
+
+#         return {
+#             "completed": True,
+#             "session_id": session_id,
+#             "scan_count": MANUAL_SCAN_COUNT,
+#             "windows": windows,
+#             "results": results,
+#             "attendance_summary": attendance_summary,
+#         }
+#         # return {
+#         #     "completed": True,
+#         #     "session_id": session_id,
+#         #     "scan_count": MANUAL_SCAN_COUNT,
+#         #     "windows": windows,
+#         #     "results": results,
+#         # }

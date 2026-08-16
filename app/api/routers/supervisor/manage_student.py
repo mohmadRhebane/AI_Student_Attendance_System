@@ -26,75 +26,246 @@ router = APIRouter(
 )
 
 
-@router.get("/get-students",response_model=StudentResponse)
+@router.get("/get-students")
 async def get_students(
-        session: AsyncSession = Depends(get_session),
-        current_supervisor: Supervisor = Depends(get_current_supervisor)
+    session: AsyncSession = Depends(get_session),
+    current_supervisor: Supervisor = Depends(
+        get_current_supervisor
+    ),
 ):
-    result = await session.execute(select(Student).offset(0).limit(100))
-    students = result.scalars().all()
-    if not students:
-        raise AppException(status_code=404,message="There are no students")
-    return success_response(message="Students retrieved successfully", data=students)
-
-@router.get("/get-classroom-students/{classroom_id}")
-async def get_classroom_students(
-        classroom_id: int,
-        session: AsyncSession = Depends(get_session),
-        current_supervisor: Supervisor = Depends(get_current_supervisor)
-):
-    classroom_query = select(Classroom).where(Classroom.id == classroom_id)
-    classroom_result = await session.execute(classroom_query)
-    classroom = classroom_result.scalar_one_or_none()
-
-    if not classroom:
-        raise AppException(status_code=404, message="Classroom not found.")
-
-    if classroom.supervisor_id != current_supervisor.id:
-        raise AppException(
-            status_code=403,
-            message="You are not authorized to view students in this classroom."
+    result = await session.execute(
+        select(Student)
+        .join(
+            Classroom,
+            Classroom.id == Student.classroom_id,
         )
+        .where(
+            Classroom.supervisor_id
+            == current_supervisor.id
+        )
+        .order_by(Student.id.asc())
+    )
 
-    students_query = select(Student).where(Student.classroom_id == classroom_id)
-    students_result = await session.execute(students_query)
-    students = students_result.scalars().all()
-    if not students:
-        raise AppException(status_code=404,message="There are no students")
-    return success_response(message="Students retrieved successfully", data=students)
+    students = result.scalars().all()
 
-@router.get("/get-student/{classroom_id}")
-async def get_student(
-        classroom_id: int,
-        session: AsyncSession = Depends(get_session),
-        current_supervisor: Supervisor = Depends(get_current_supervisor)
+    return success_response(
+        message="Students retrieved successfully",
+        data=students,
+    )
+
+# @router.get("/get-students",response_model=StudentResponse)
+# async def get_students(
+#         session: AsyncSession = Depends(get_session),
+#         current_supervisor: Supervisor = Depends(get_current_supervisor)
+# ):
+#     result = await session.execute(select(Student).offset(0).limit(100))
+#     students = result.scalars().all()
+#     if not students:
+#         raise AppException(status_code=404,message="There are no students")
+#     return success_response(message="Students retrieved successfully", data=students)
+
+# @router.get("/get-classroom-students/{classroom_id}")
+# async def get_classroom_students(
+#         classroom_id: int,
+#         session: AsyncSession = Depends(get_session),
+#         current_supervisor: Supervisor = Depends(get_current_supervisor)
+# ):
+#     classroom_query = select(Classroom).where(Classroom.id == classroom_id)
+#     classroom_result = await session.execute(classroom_query)
+#     classroom = classroom_result.scalar_one_or_none()
+
+#     if not classroom:
+#         raise AppException(status_code=404, message="Classroom not found.")
+
+#     if classroom.supervisor_id != current_supervisor.id:
+#         raise AppException(
+#             status_code=403,
+#             message="You are not authorized to view students in this classroom."
+#         )
+
+#     students_query = select(Student).where(Student.classroom_id == classroom_id)
+#     students_result = await session.execute(students_query)
+#     students = students_result.scalars().all()
+#     if not students:
+#         raise AppException(status_code=404,message="There are no students")
+#     return success_response(message="Students retrieved successfully", data=students)
+
+
+@router.get(
+    "/get-classroom-students/{classroom_id}"
+)
+async def get_classroom_students(
+    classroom_id: int,
+    session: AsyncSession = Depends(get_session),
+    current_supervisor: Supervisor = Depends(
+        get_current_supervisor
+    ),
 ):
-    query = select(Student).where(Student.classroom_id == classroom_id)
-    result = await session.execute(query)
-    student = result.scalar_one_or_none()
-    if not student:
-        raise AppException(status_code=404, message="Student not found.")
-    return success_response(message="Student retrieved successfully", data=student)
+    # ==========================================
+    # التحقق من أن الصف موجود ويتبع المشرف
+    # ==========================================
 
-
-@router.get("/search-for-student/{name}")
-async def search_for_student(
-        name: str,
-        session: AsyncSession = Depends(get_session),
-        current_supervisor: Supervisor = Depends(get_current_supervisor),
-):
-    search_term = prepare_arabic_search(name)
-    query = select(Student).where(
-        or_(
-            Student.first_name.ilike(search_term),
-            Student.last_name.ilike(search_term)
+    classroom_result = await session.execute(
+        select(Classroom).where(
+            Classroom.id == classroom_id,
+            Classroom.supervisor_id
+            == current_supervisor.id,
         )
     )
-    result = await session.execute(query)
+
+    classroom = (
+        classroom_result.scalar_one_or_none()
+    )
+
+    if classroom is None:
+        raise AppException(
+            status_code=404,
+            message=(
+                "Classroom not found or you are "
+                "not authorized to access it."
+            ),
+        )
+
+    # ==========================================
+    # جلب الطلاب
+    # ==========================================
+
+    students_result = await session.execute(
+        select(Student)
+        .where(
+            Student.classroom_id
+            == classroom_id
+        )
+        .order_by(Student.id.asc())
+    )
+
+    students = (
+        students_result.scalars().all()
+    )
+
+    # [] ليست Error
+    return success_response(
+        message="Students retrieved successfully",
+        data=students,
+    )
+
+
+# @router.get("/get-student/{classroom_id}")
+# async def get_student(
+#         classroom_id: int,
+#         session: AsyncSession = Depends(get_session),
+#         current_supervisor: Supervisor = Depends(get_current_supervisor)
+# ):
+#     query = select(Student).where(Student.classroom_id == classroom_id)
+#     result = await session.execute(query)
+#     student = result.scalar_one_or_none()
+#     if not student:
+#         raise AppException(status_code=404, message="Student not found.")
+#     return success_response(message="Student retrieved successfully", data=student)
+
+@router.get(
+    "/get-student/{student_id}"
+)
+async def get_student(
+    student_id: int,
+    session: AsyncSession = Depends(get_session),
+    current_supervisor: Supervisor = Depends(
+        get_current_supervisor
+    ),
+):
+    result = await session.execute(
+        select(Student)
+        .join(
+            Classroom,
+            Classroom.id == Student.classroom_id,
+        )
+        .where(
+            Student.id == student_id,
+            Classroom.supervisor_id
+            == current_supervisor.id,
+        )
+    )
+
+    student = result.scalar_one_or_none()
+
+    if student is None:
+        raise AppException(
+            status_code=404,
+            message=(
+                "Student not found or you are "
+                "not authorized to access it."
+            ),
+        )
+
+    return success_response(
+        message="Student retrieved successfully",
+        data=student,
+    )
+
+
+# @router.get("/search-for-student/{name}")
+# async def search_for_student(
+#         name: str,
+#         session: AsyncSession = Depends(get_session),
+#         current_supervisor: Supervisor = Depends(get_current_supervisor),
+# ):
+#     search_term = prepare_arabic_search(name)
+#     query = select(Student).where(
+#         or_(
+#             Student.first_name.ilike(search_term),
+#             Student.last_name.ilike(search_term)
+#         )
+#     )
+#     result = await session.execute(query)
+#     students = result.scalars().all()
+#     if not students:
+#         raise AppException(status_code=404, message="There are no students")
+#     return success_response(message="Students retrieved successfully", data=students)
+
+@router.get(
+    "/search-for-student/{name}"
+)
+async def search_for_student(
+    name: str,
+    session: AsyncSession = Depends(get_session),
+    current_supervisor: Supervisor = Depends(
+        get_current_supervisor
+    ),
+):
+    search_term = prepare_arabic_search(
+        name
+    )
+
+    result = await session.execute(
+        select(Student)
+        .join(
+            Classroom,
+            Classroom.id == Student.classroom_id,
+        )
+        .where(
+            Classroom.supervisor_id
+            == current_supervisor.id,
+            or_(
+                Student.first_name.ilike(
+                    search_term
+                ),
+                Student.last_name.ilike(
+                    search_term
+                ),
+                Student.father_name.ilike(
+                    search_term
+                ),
+            ),
+        )
+        .order_by(Student.id.asc())
+    )
+
     students = result.scalars().all()
-    if not students:
-        raise AppException(status_code=404, message="There are no students")
-    return success_response(message="Students retrieved successfully", data=students)
+
+    return success_response(
+        message="Students retrieved successfully",
+        data=students,
+    )
 
 def prepare_arabic_search(text: str) -> str:
     text = re.sub(r'[أإآا]', '_', text)

@@ -9,69 +9,88 @@ from app.models.session import Session
 from app.models.student import Student
 
 
+from datetime import date
+
+
 async def save_scan_logs(
     db: AsyncSession,
     session_id: int,
+    attendance_date: date,
     scan_number: int,
     ai_result,
+    min_confidence_score: float = 0.0,
 ) -> int:
-    """
-    Save ONE successful AI scan into attendance_logs.
-
-    Important:
-    - Only PRESENT students are stored.
-    - ABSENT is not decided here.
-    - Re-running the same scan_number replaces that scan's old logs.
-    """
 
     if scan_number < 1:
-        raise ValueError("scan_number must be >= 1.")
+        raise ValueError(
+            "scan_number must be >= 1."
+        )
 
     if not ai_result.succeeded:
         raise RuntimeError(
-            f"AI scan failed: {ai_result.error_message}"
+            f"AI scan failed: "
+            f"{ai_result.error_message}"
         )
 
-    db_session = await db.get(Session, session_id)
+    db_session = await db.get(
+        Session,
+        session_id,
+    )
 
     if not db_session:
-        raise ValueError("Session not found.")
+        raise ValueError(
+            "Session not found."
+        )
 
     roster_result = await db.execute(
         select(Student.id).where(
-            Student.classroom_id == db_session.classroom_id,
+            Student.classroom_id
+            == db_session.classroom_id,
+
             Student.is_active.is_(True),
         )
     )
 
     roster_ids = {
         int(student_id)
-        for student_id in roster_result.scalars().all()
+        for student_id
+        in roster_result.scalars().all()
     }
 
-    # إذا أعدنا تنفيذ نفس Scan فلا ننشئ duplicate.
+    # إعادة Scan نفسها لا تصنع duplicate
     await db.execute(
         delete(AttendanceLogs).where(
-            AttendanceLogs.session_id == session_id,
-            AttendanceLogs.scan_number == scan_number,
+            AttendanceLogs.session_id
+            == session_id,
+
+            AttendanceLogs.attendance_date
+            == attendance_date,
+
+            AttendanceLogs.scan_number
+            == scan_number,
         )
     )
 
     inserted = 0
 
     for item in ai_result.attendance:
+
         status_value = getattr(
             item.status,
             "value",
             item.status,
         )
 
-        if str(status_value).upper() != "PRESENT":
+        if (
+            str(status_value).upper()
+            != "PRESENT"
+        ):
             continue
 
-        student_id = int(item.student_id)
+        student_id = int(
+            item.student_id
+        )
 
-        # لا نقبل أي Student خارج roster هذه الحصة.
         if student_id not in roster_ids:
             continue
 
@@ -81,16 +100,30 @@ async def save_scan_logs(
             else None
         )
 
-        # ملاحظة:
-        # هذا هو عدد observations المقبولة من AI،
-        # وليس عدد كل face detections الخام.
+        # ======================================
+        # Database confidence threshold
+        # ======================================
+
+        if confidence_score is None:
+            continue
+
+        if (
+            confidence_score
+            < float(min_confidence_score)
+        ):
+            continue
+
         detection_count = max(
             1,
-            int(item.observation_count or 1),
+            int(
+                item.observation_count
+                or 1
+            ),
         )
 
         log = AttendanceLogs(
             session_id=session_id,
+            attendance_date=attendance_date,
             student_id=student_id,
             scan_number=scan_number,
             confidence_score=confidence_score,
@@ -98,6 +131,7 @@ async def save_scan_logs(
         )
 
         db.add(log)
+
         inserted += 1
 
     await db.flush()
@@ -105,9 +139,11 @@ async def save_scan_logs(
     return inserted
 
 
+
 async def finalize_attendance(
     db: AsyncSession,
     session_id: int,
+    attendance_date: date,
 ) -> int:
     """
     Build the FINAL attendance_records from all successful scan logs.
@@ -136,30 +172,35 @@ async def finalize_attendance(
     )
 
     students = students_result.scalars().all()
-
     aggregate_result = await db.execute(
-        select(
-            AttendanceLogs.student_id,
-            func.max(
-                AttendanceLogs.confidence_score
-            ).label("best_confidence"),
-            func.sum(
-                AttendanceLogs.detection_count
-            ).label("total_detections"),
-            func.count(
-                func.distinct(
-                    AttendanceLogs.scan_number
-                )
-            ).label("present_scans"),
-        )
-        .where(
-            AttendanceLogs.session_id == session_id
-        )
-        .group_by(
-            AttendanceLogs.student_id
-        )
-    )
+    select(
+        AttendanceLogs.student_id,
 
+        func.max(
+            AttendanceLogs.confidence_score
+        ).label("best_confidence"),
+
+        func.sum(
+            AttendanceLogs.detection_count
+        ).label("total_detections"),
+
+        func.count(
+            func.distinct(
+                AttendanceLogs.scan_number
+            )
+        ).label("present_scans"),
+    )
+    .where(
+        AttendanceLogs.session_id
+        == session_id,
+
+        AttendanceLogs.attendance_date
+        == attendance_date,
+    )
+    .group_by(
+        AttendanceLogs.student_id
+    )
+)
     evidence = {
         int(row.student_id): row
         for row in aggregate_result.all()
@@ -167,7 +208,11 @@ async def finalize_attendance(
 
     existing_result = await db.execute(
         select(AttendanceRecord).where(
-            AttendanceRecord.session_id == session_id
+            AttendanceRecord.session_id
+            == session_id,
+
+            AttendanceRecord.attendance_date
+            == attendance_date,
         )
     )
 
@@ -220,13 +265,14 @@ async def finalize_attendance(
         else:
             record = AttendanceRecord(
                 session_id=session_id,
+                attendance_date=attendance_date,
                 student_id=student.id,
                 supervisor_id=classroom.supervisor_id,
                 status=final_status,
                 confidence_score=final_confidence,
                 manually_modified=False,
                 notes=notes,
-            )
+)
 
             db.add(record)
 

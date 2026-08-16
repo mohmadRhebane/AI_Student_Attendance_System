@@ -110,3 +110,15 @@ htmlcov/
 /legacy_alembic_versions/
 
 *.before_*.py
+
+
+# Ignore Gallery and Personal Data
+backup_gallery_*/
+data/generated/
+data/enrollment_staging/
+*.npz
+*.jpg
+*.png
+
+# Ignore Models
+models/
