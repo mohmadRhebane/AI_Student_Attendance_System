@@ -121,4 +121,4 @@ data/enrollment_staging/
 *.png
 
 # Ignore Models
-models/
+/models/
